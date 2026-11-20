@@ -1,0 +1,833 @@
+#include "../flipbip.h"
+#include <furi.h>
+#include <input/input.h>
+#include <string.h>
+#include "../helpers/flipbip_string.h"
+#include "../helpers/flipbip_file.h"
+#include "../helpers/flipbip_xmr_words.h"
+// From: /lib/crypto
+#include <memzero.h>
+#include <curves.h>
+#include <bip32.h>
+#include <bip39.h>
+#include <segwit_addr.h>
+#include <monero/monero.h>
+
+#define SEGWIT_HRP    "bc"
+#define DERIV_ACCOUNT 0
+#define DERIV_CHANGE  0
+
+#define LINE_BUF     32 // longest rendered line (30) + null, rounded up
+#define XKEY_BUF     (111 + 1) // base58check of a 78 byte BIP32 key is 111 chars
+#define MAX_ADDR_BUF (95 + 1) // XMR standard address/subaddress is 95 chars
+#define NUM_ADDRS    6
+
+#define PAGE_LOADING    0
+#define PAGE_INFO       1
+#define PAGE_MNEMONIC   2
+#define PAGE_SEED       3
+#define PAGE_XPRV_ROOT  4
+#define PAGE_XPRV_ACCT  5
+#define PAGE_XPUB_ACCT  6
+#define PAGE_XPRV_EXTD  7
+#define PAGE_XPUB_EXTD  8
+#define PAGE_ADDR_BEGIN 9
+#define PAGE_ADDR_END   (PAGE_ADDR_BEGIN + NUM_ADDRS - 1)
+#define PAGE_ERROR      (PAGE_ADDR_END + 1)
+
+#define TEXT_LOADING         "Loading..."
+#define TEXT_NEW_WALLET      "New wallet"
+#define TEXT_RECEIVE_ADDRESS "receive address:"
+#define TEXT_XMR_SPEND_KEY   "Private spend key:"
+#define TEXT_XMR_VIEW_KEY    "Private view key:"
+#define TEXT_XMR_SEED_1      "Monero seed, words 1-12:"
+#define TEXT_XMR_SEED_2      "Monero seed, words 13-25:"
+#define TEXT_QRFILE_EXT      ".qrcode"
+#define WARN_TITLE           "Recommendation:"
+#define WARN_TITLE_PLURAL    "Recommendations:"
+#define WARN_PASSPHRASE      "Set BIP39 Passphrase"
+#define WARN_LEGACY          "Use Secure Enclave"
+
+// Info page: a centered title, then page numbers and what is on those pages
+// in two columns (FontSecondary is proportional, so spaces can't align them)
+#define INFO_ROWS   5
+#define INFO_DESC_X 28 // after "p4,5)" (23px); widest description is 99px
+static const char TEXT_INFO_TITLE[] = "-Scroll pages with up/down-";
+static const char* const TEXT_INFO_PAGES[INFO_ROWS] = {"p1,2)", "p3)", "p4,5)", "p6,7)", "p8+)"};
+static const char* const TEXT_INFO[INFO_ROWS] = {
+    "BIP39 Mnemonic/Seed",
+    "BIP32 Root Key",
+    "Prv/Pub Account Keys",
+    "Prv/Pub BIP32 Keys",
+    "Receive Addresses",
+};
+// Monero shows its own 25 word seed and spend/view keys
+static const char* const TEXT_INFO_XMR[INFO_ROWS] = {
+    "BIP39 Mnemonic/Seed",
+    "BIP32 Root Key",
+    "Monero 25-word Seed",
+    "Prv Spend/View Keys",
+    "Address/Subaddresses",
+};
+
+struct FlipBipScene1 {
+    View* view;
+    FlipBipScene1Callback callback;
+    void* context;
+};
+
+// Everything derived from the mnemonic, in a single allocation that only
+// exists while the wallet is on screen.
+typedef struct {
+    CONFIDENTIAL char mnemonic[TEXT_BUFFER_SIZE];
+    CONFIDENTIAL uint8_t seed[64];
+    CONFIDENTIAL char xprv_root[XKEY_BUF];
+    union {
+        // m/44'/coin'/0' xprv and xpub
+        struct {
+            CONFIDENTIAL char xprv_account[XKEY_BUF];
+            char xpub_account[XKEY_BUF];
+        };
+        // XMR only: the private spend key as Monero's 25 word mnemonic
+        CONFIDENTIAL char xmr_mnemonic[FLIPBIP_XMR_MNEMONIC_BUF];
+    };
+    // m/44'/coin'/0'/0 xprv and xpub; for XMR the private spend and view keys (hex)
+    CONFIDENTIAL char xprv_extended[XKEY_BUF];
+    CONFIDENTIAL char xpub_extended[XKEY_BUF];
+    char recv_addresses[NUM_ADDRS][MAX_ADDR_BUF];
+} FlipBipWallet;
+
+// Shared between the GUI thread (draw) and the app thread (input/enter/exit),
+// so it is only ever touched through with_view_model().
+typedef struct {
+    int page;
+    uint32_t coin_type;
+    bool warn_insecure;
+    bool warn_legacy; // legacy encryption on a Flipper with a secure enclave
+    const char* derivation_text;
+    const char* error; // set when page == PAGE_ERROR
+    FlipBipWallet* wallet; // NULL unless fully derived
+} FlipBipScene1Model;
+
+static uint32_t flipbip_coin_fmt(uint32_t coin_type) {
+    return COIN_INFO_ARRAY[coin_type][COIN_INFO_ADDR_FMT];
+}
+
+void flipbip_scene_1_set_callback(
+    FlipBipScene1* instance,
+    FlipBipScene1Callback callback,
+    void* context) {
+    furi_assert(instance);
+    furi_assert(callback);
+    instance->callback = callback;
+    instance->context = context;
+}
+
+static void flipbip_wallet_free(FlipBipWallet* wallet) {
+    if(wallet) {
+        memzero(wallet, sizeof(FlipBipWallet));
+        free(wallet);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Drawing. Runs on the GUI thread, so it only uses stack buffers: nothing
+ * here may be shared with the app thread outside of the model lock.
+ * ------------------------------------------------------------------------- */
+
+// Copy line `index` of `text` (fixed `line_len` characters per line) into `out`.
+// When `chunk` is set, a space is inserted before every group of 4 characters.
+static void flipbip_scene_1_line(
+    char* out,
+    const char* text,
+    size_t text_len,
+    size_t line_len,
+    size_t index,
+    bool chunk) {
+    out[0] = '\0';
+    const size_t start = index * line_len;
+    if(start >= text_len) return;
+    size_t n = text_len - start;
+    if(n > line_len) n = line_len;
+
+    size_t o = 0;
+    for(size_t i = 0; i < n && o < LINE_BUF - 2; i++) {
+        if(chunk && i % 4 == 0) out[o++] = ' ';
+        out[o++] = text[start + i];
+    }
+    out[o] = '\0';
+}
+
+static void flipbip_scene_1_draw_info(Canvas* canvas, bool xmr) {
+    const char* const* desc = xmr ? TEXT_INFO_XMR : TEXT_INFO;
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, TEXT_INFO_TITLE);
+    for(int i = 0; i < INFO_ROWS; i++) {
+        const int y = 12 + i * 10;
+        canvas_draw_str_aligned(canvas, 1, y, AlignLeft, AlignTop, TEXT_INFO_PAGES[i]);
+        canvas_draw_str_aligned(canvas, INFO_DESC_X, y, AlignLeft, AlignTop, desc[i]);
+    }
+}
+
+// Wrap `text` at any character so that no line passes the right screen edge
+// (by real pixel width of the current font). If `draw`, lines are drawn from
+// (x, y0) at `pitch`. Returns the number of lines needed.
+// Worst cases in the small font, from x = 1: 16 base58 or 21 hex characters
+// per line, so a 111 char xprv or a 128 char hex seed never needs more than 7.
+static int flipbip_scene_1_wrap_chars(
+    Canvas* canvas,
+    const char* text,
+    int32_t x,
+    int32_t y0,
+    int32_t pitch,
+    bool draw) {
+    char line[64]; // narrowest glyphs are 3px, so at most ~42 per line
+    size_t len = 0;
+    int lines = 0;
+    for(const char* p = text; *p; p++) {
+        line[len] = *p;
+        line[len + 1] = '\0';
+        if(len > 0 && (x + canvas_string_width(canvas, line) > 128 || len + 2 >= sizeof(line))) {
+            line[len] = '\0';
+            if(draw)
+                canvas_draw_str_aligned(canvas, x, y0 + lines * pitch, AlignLeft, AlignTop, line);
+            lines++;
+            line[0] = *p;
+            line[1] = '\0';
+            len = 1;
+        } else {
+            len++;
+        }
+    }
+    if(len > 0) {
+        if(draw) canvas_draw_str_aligned(canvas, x, y0 + lines * pitch, AlignLeft, AlignTop, line);
+        lines++;
+    }
+    memzero(line, sizeof(line));
+    return lines;
+}
+
+// xprv / xpub (111 chars): up to 7 lines at a 9px pitch
+static void flipbip_scene_1_draw_key(Canvas* canvas, const char* key) {
+    canvas_set_font(canvas, FontSecondary);
+    flipbip_scene_1_wrap_chars(canvas, key, 1, 1, 9, true);
+}
+
+// Greedy-wrap words [w0, w0 + n) of the space separated `text` to the screen
+// width (by real pixel width of the current font). If `draw`, lines are drawn
+// from y0 at a 9px pitch. If `prefix` > 0 only that many letters of each word
+// are used. Returns the number of lines needed.
+static int flipbip_scene_1_wrap(
+    Canvas* canvas,
+    const char* text,
+    int w0,
+    int n,
+    int32_t y0,
+    size_t prefix,
+    bool draw) {
+    char line[64];
+    size_t len = 0;
+    int lines = 0;
+    const char* p = text;
+    for(int w = 0; *p && w < w0 + n; w++) {
+        const char* end = strchr(p, ' ');
+        size_t wlen = end ? (size_t)(end - p) : strlen(p);
+        const char* word = p;
+        p += wlen + (end ? 1 : 0);
+        if(w < w0) continue;
+        if(prefix && wlen > prefix) wlen = prefix;
+        if(wlen > sizeof(line) - 2) wlen = sizeof(line) - 2;
+
+        // try appending the word to the current line
+        if(len > 0 && len + 1 + wlen < sizeof(line)) {
+            line[len] = ' ';
+            memcpy(line + len + 1, word, wlen);
+            line[len + 1 + wlen] = '\0';
+            if(canvas_string_width(canvas, line) <= 127) {
+                len += 1 + wlen;
+                continue;
+            }
+            line[len] = '\0';
+        }
+        // line full (or first word): emit it, start a new one
+        if(len > 0) {
+            if(draw) canvas_draw_str_aligned(canvas, 1, y0 + lines * 9, AlignLeft, AlignTop, line);
+            lines++;
+        }
+        memcpy(line, word, wlen);
+        line[wlen] = '\0';
+        len = wlen;
+    }
+    if(len > 0) {
+        if(draw) canvas_draw_str_aligned(canvas, 1, y0 + lines * 9, AlignLeft, AlignTop, line);
+        lines++;
+    }
+    memzero(line, sizeof(line));
+    return lines;
+}
+
+static void flipbip_scene_1_draw_mnemonic(Canvas* canvas, const char* mnemonic) {
+    // Up to 24 words fit in 7 lines for any realistic phrase. If not, fall back
+    // to the first 4 letters of each word, which identify a BIP39 word uniquely
+    // (at most 28px each, so 4 per line: 24 words in 6 lines).
+    canvas_set_font(canvas, FontSecondary);
+    if(flipbip_scene_1_wrap(canvas, mnemonic, 0, 24, 0, 0, false) <= 7) {
+        flipbip_scene_1_wrap(canvas, mnemonic, 0, 24, 1, 0, true);
+    } else {
+        canvas_draw_str_aligned(
+            canvas, 1, 0, AlignLeft, AlignTop, "First 4 letters of each word:");
+        flipbip_scene_1_wrap(canvas, mnemonic, 0, 24, 10, 4, true);
+    }
+}
+
+// Monero 25 word seed over two pages: words 1-12, then 13-25. Two words always
+// fit on a line (the widest is 53px), so that is at most 6 and 7 lines.
+static void flipbip_scene_1_draw_xmr_mnemonic(Canvas* canvas, const char* words, bool second) {
+    canvas_set_font(canvas, FontSecondary);
+    const int w0 = second ? 12 : 0;
+    const int n = second ? 13 : 12;
+    if(flipbip_scene_1_wrap(canvas, words, w0, n, 0, 0, false) <= 6) {
+        canvas_draw_str_aligned(
+            canvas, 1, 0, AlignLeft, AlignTop, second ? TEXT_XMR_SEED_2 : TEXT_XMR_SEED_1);
+        flipbip_scene_1_wrap(canvas, words, w0, n, 10, 0, true);
+    } else {
+        // only for a run of very long words: use all 7 lines, no header
+        flipbip_scene_1_wrap(canvas, words, w0, n, 2, 0, true);
+    }
+}
+
+static void flipbip_scene_1_draw_seed(Canvas* canvas, const uint8_t* seed) {
+    // 128 hex chars: up to 7 lines at a 9px pitch
+    char hex[64 * 2 + 1];
+    flipbip_btox(seed, 64, hex);
+    canvas_set_font(canvas, FontSecondary);
+    flipbip_scene_1_wrap_chars(canvas, hex, 1, 1, 9, true);
+    memzero(hex, sizeof(hex));
+}
+
+static void flipbip_scene_1_draw_xmr_key(Canvas* canvas, const char* title, const char* hex) {
+    // 64 hex chars: 3-4 lines under the title
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 1, 2, AlignLeft, AlignTop, title);
+    flipbip_scene_1_wrap_chars(canvas, hex, 1, 14, 10, true);
+}
+
+static void flipbip_scene_1_draw_address(Canvas* canvas, const FlipBipScene1Model* model) {
+    const int index = model->page - PAGE_ADDR_BEGIN;
+    const char* label = COIN_TEXT_ARRAY[model->coin_type][COIN_TEXT_LABEL];
+    const char* file = COIN_TEXT_ARRAY[model->coin_type][COIN_TEXT_FILE];
+    const char* addr = model->wallet->recv_addresses[index];
+    char line[LINE_BUF];
+
+    // header: "<coin> receive address:"            "/N"
+    int extra_space = 1;
+    const bool xmr = flipbip_coin_fmt(model->coin_type) == CoinTypeXMR128;
+    if(xmr) {
+        extra_space = 3;
+    }
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 2, 2, AlignLeft, AlignTop, label);
+    canvas_draw_str_aligned(
+        canvas, strlen(label) * 7 + extra_space, 2, AlignLeft, AlignTop, TEXT_RECEIVE_ADDRESS);
+    snprintf(line, sizeof(line), "/%d", index);
+    canvas_draw_str_aligned(canvas, 125, 2, AlignRight, AlignTop, line);
+
+    // footer: QR code file name
+    snprintf(line, sizeof(line), "%s%02x%s", file, index, TEXT_QRFILE_EXT);
+
+    if(xmr) {
+        // 95 chars wrapped in the small font: 5 lines, or 6 (at most, 16 per
+        // line worst case) in which case the file name gives way. Small font
+        // text at top y covers rows y..y+8, so the last line starts at <= 55.
+        if(flipbip_scene_1_wrap_chars(canvas, addr, 1, 10, 9, false) <= 5) {
+            canvas_draw_str_aligned(canvas, 125, 55, AlignRight, AlignTop, line);
+        }
+        flipbip_scene_1_wrap_chars(canvas, addr, 1, 10, 9, true);
+        return;
+    }
+    canvas_draw_str_aligned(canvas, 125, 53, AlignRight, AlignTop, line);
+
+    // address in groups of 4 characters, bold: 3 lines of 12 for base58
+    // (34-35 chars), 3 lines of 14 for ETH and bech32 (42 chars)
+    const size_t len = strlen(addr);
+    const size_t line_len = len > 36 ? 14 : 12;
+    bool fits = true;
+    canvas_set_font(canvas, FontPrimary);
+    for(size_t i = 0; i < 4 && fits; i++) {
+        flipbip_scene_1_line(line, addr, len, line_len, i, true);
+        fits = 7 + canvas_string_width(canvas, line) <= 128;
+    }
+    if(fits) {
+        for(size_t i = 0; i < 4; i++) {
+            flipbip_scene_1_line(line, addr, len, line_len, i, true);
+            canvas_draw_str(canvas, 7, 22 + i * 12, line);
+        }
+    } else {
+        // only for a run of wide glyphs: small font, wrapped (always <= 3 lines)
+        canvas_set_font(canvas, FontSecondary);
+        flipbip_scene_1_wrap_chars(canvas, addr, 7, 16, 10, true);
+    }
+}
+
+static void flipbip_scene_1_draw(Canvas* canvas, void* _model) {
+    FlipBipScene1Model* model = _model;
+    const FlipBipWallet* w = model->wallet;
+
+    canvas_clear(canvas);
+    canvas_set_color(canvas, ColorBlack);
+
+    if(model->page == PAGE_ERROR) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 2, 12, "ERROR:");
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 26, model->error);
+        return;
+    }
+
+    // Every other page needs a fully derived wallet
+    if(model->page == PAGE_LOADING || w == NULL) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 2, 10, TEXT_LOADING);
+        if(model->derivation_text) canvas_draw_str(canvas, 7, 30, model->derivation_text);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 125, 2, AlignRight, AlignTop, FLIPBIP_VERSION);
+        if(model->warn_insecure && model->warn_legacy) {
+            canvas_draw_str(canvas, 2, 41, WARN_TITLE_PLURAL);
+            canvas_draw_str(canvas, 2, 51, WARN_PASSPHRASE);
+            canvas_draw_str(canvas, 2, 61, WARN_LEGACY);
+        } else if(model->warn_insecure || model->warn_legacy) {
+            canvas_draw_str(canvas, 2, 50, WARN_TITLE);
+            canvas_draw_str(canvas, 2, 60, model->warn_insecure ? WARN_PASSPHRASE : WARN_LEGACY);
+        }
+        return;
+    }
+
+    const bool xmr = flipbip_coin_fmt(model->coin_type) == CoinTypeXMR128;
+    switch(model->page) {
+    case PAGE_INFO:
+        flipbip_scene_1_draw_info(canvas, xmr);
+        break;
+    case PAGE_MNEMONIC:
+        flipbip_scene_1_draw_mnemonic(canvas, w->mnemonic);
+        break;
+    case PAGE_SEED:
+        flipbip_scene_1_draw_seed(canvas, w->seed);
+        break;
+    case PAGE_XPRV_ROOT:
+        flipbip_scene_1_draw_key(canvas, w->xprv_root);
+        break;
+    case PAGE_XPRV_ACCT:
+        if(xmr) {
+            flipbip_scene_1_draw_xmr_mnemonic(canvas, w->xmr_mnemonic, false);
+        } else {
+            flipbip_scene_1_draw_key(canvas, w->xprv_account);
+        }
+        break;
+    case PAGE_XPUB_ACCT:
+        if(xmr) {
+            flipbip_scene_1_draw_xmr_mnemonic(canvas, w->xmr_mnemonic, true);
+        } else {
+            flipbip_scene_1_draw_key(canvas, w->xpub_account);
+        }
+        break;
+    case PAGE_XPRV_EXTD:
+        if(xmr) {
+            flipbip_scene_1_draw_xmr_key(canvas, TEXT_XMR_SPEND_KEY, w->xprv_extended);
+        } else {
+            flipbip_scene_1_draw_key(canvas, w->xprv_extended);
+        }
+        break;
+    case PAGE_XPUB_EXTD:
+        if(xmr) {
+            flipbip_scene_1_draw_xmr_key(canvas, TEXT_XMR_VIEW_KEY, w->xpub_extended);
+        } else {
+            flipbip_scene_1_draw_key(canvas, w->xpub_extended);
+        }
+        break;
+    default:
+        flipbip_scene_1_draw_address(canvas, model);
+        break;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Wallet derivation. Runs on the app thread WITHOUT the model lock held, so
+ * the GUI thread can keep drawing the loading screen meanwhile.
+ * ------------------------------------------------------------------------- */
+
+static void flipbip_scene_1_init_address(
+    char* addr_text,
+    HDNode* addr_node,
+    const HDNode* node,
+    uint32_t coin_type,
+    uint32_t addr_index) {
+    memcpy(addr_node, node, sizeof(HDNode));
+    hdnode_private_ckd(addr_node, addr_index);
+    hdnode_fill_public_key(addr_node);
+
+    const uint32_t fmt = flipbip_coin_fmt(coin_type);
+    if(fmt == CoinTypeBTC84) {
+        // Native SegWit P2WPKH: bech32(hrp, v0, hash160(pubkey))
+        uint8_t hash[20];
+        ecdsa_get_pubkeyhash(addr_node->public_key, HASHER_SHA2_RIPEMD, hash);
+        segwit_addr_encode(addr_text, SEGWIT_HRP, 0, hash, sizeof(hash));
+    } else if(fmt == CoinTypeETH60) {
+        // ETH style address: "0x" + hex(keccak(pubkey)[12:])
+        uint8_t hash[20];
+        hdnode_get_ethereum_pubkeyhash(addr_node, hash);
+        addr_text[0] = '0';
+        addr_text[1] = 'x';
+        flipbip_btox(hash, sizeof(hash), addr_text + 2);
+    } else {
+        // BTC / DOGE / ZEC style address (version bytes produce the prefix)
+        ecdsa_get_address(
+            addr_node->public_key,
+            COIN_INFO_ARRAY[coin_type][COIN_INFO_ADDR_VERS],
+            HASHER_SHA2_RIPEMD,
+            HASHER_SHA2D,
+            addr_text,
+            MAX_ADDR_BUF);
+    }
+
+    memzero(addr_node, sizeof(HDNode));
+}
+
+// Monero, Ledger compatible (same keys as a Ledger with the same BIP39 seed):
+//   k     = BIP32 secp256k1 private key at m/44'/128'/0'/0/0
+//   spend = sc_reduce(keccak256(k)), view = sc_reduce(keccak256(spend))
+// Address 0 is the primary address, 1..N-1 are subaddresses (account 0).
+typedef struct {
+    bignum256modm spend, view, m;
+    ge25519 G, B, A, D, P;
+    uint8_t buf[64];
+} FlipBipXmrScratch;
+
+static void flipbip_scene_1_init_xmr(
+    FlipBipWallet* w,
+    HDNode* addr_node,
+    const HDNode* node,
+    uint32_t coin_type) {
+    FlipBipXmrScratch* x = malloc(sizeof(FlipBipXmrScratch));
+
+    memcpy(addr_node, node, sizeof(HDNode));
+    hdnode_private_ckd(addr_node, 0);
+    xmr_hash_to_scalar(x->spend, addr_node->private_key, 32);
+    memzero(addr_node, sizeof(HDNode));
+    contract256_modm(x->buf, x->spend);
+    xmr_hash_to_scalar(x->view, x->buf, 32);
+
+    // Private keys, shown as the 25 word seed and on the spend/view key pages
+    flipbip_xmr_mnemonic(x->buf, w->xmr_mnemonic);
+    flipbip_btox(x->buf, 32, w->xprv_extended);
+    contract256_modm(x->buf, x->view);
+    flipbip_btox(x->buf, 32, w->xpub_extended);
+
+    // Public spend key B and view key A. Uses the constant time windowed
+    // ge25519_scalarmult on the base point G rather than the base point
+    // routines: those need a 24KB precomputed table, this needs ~2KB of stack.
+    ge25519_set_base(&x->G);
+    ge25519_scalarmult(&x->B, &x->G, x->spend);
+    ge25519_scalarmult(&x->A, &x->G, x->view);
+
+    for(uint32_t i = 0; i < NUM_ADDRS; i++) {
+        uint64_t tag = COIN_INFO_ARRAY[coin_type][COIN_INFO_ADDR_VERS];
+        if(i == 0) {
+            ge25519_pack(x->buf, &x->B);
+            ge25519_pack(x->buf + 32, &x->A);
+        } else {
+            // m = Hs("SubAddr" || view || 0 || i)
+            // D = B + mG = (spend + m)G,  C = view * D = (view * (spend + m))G
+            tag = 42;
+            xmr_get_subaddress_secret_key(x->m, 0, i, x->view);
+            add256_modm(x->m, x->m, x->spend);
+            ge25519_scalarmult(&x->D, &x->G, x->m);
+            mul256_modm(x->m, x->m, x->view);
+            ge25519_scalarmult(&x->P, &x->G, x->m);
+            ge25519_pack(x->buf, &x->D);
+            ge25519_pack(x->buf + 32, &x->P);
+        }
+        xmr_base58_addr_encode_check(tag, x->buf, 64, w->recv_addresses[i], MAX_ADDR_BUF);
+    }
+
+    memzero(x, sizeof(FlipBipXmrScratch));
+    free(x);
+}
+
+static FlipBipStatus flipbip_wallet_init(
+    FlipBipWallet* w,
+    const int strength,
+    const uint32_t coin_type,
+    const bool overwrite,
+    const char* passphrase_text,
+    const FlipBipEncryption encryption,
+    const bool enclave_available) {
+    // Generate and save a new mnemonic if asked to, or if none is saved yet
+    bool mnemonic_only = false;
+    const FlipBipWalletFormat format = flipbip_wallet_format();
+    if(overwrite || format == FlipBipWalletNone) {
+        mnemonic_only = true;
+        const char* mnemonic_gen = mnemonic_generate(strength);
+        FlipBipStatus status = FlipBipStatusSuccess;
+        if(mnemonic_check(mnemonic_gen) == 0) {
+            status = FlipBipStatusMnemonicCheckError;
+        } else if(!flipbip_save_file_secure(mnemonic_gen, encryption)) {
+            status = FlipBipStatusSaveError;
+        }
+        mnemonic_clear();
+        if(status != FlipBipStatusSuccess) return status;
+    }
+
+    // Load the mnemonic from persistent storage
+    if(!flipbip_load_file_secure(w->mnemonic)) {
+        // Enclave wallets can't be opened on Flipper clones
+        return format == FlipBipWalletEnclave && !enclave_available ? FlipBipStatusEnclaveError :
+                                                                      FlipBipStatusLoadError;
+    }
+    if(mnemonic_check(w->mnemonic) == 0) return FlipBipStatusMnemonicCheckError;
+
+    // Only generating a new mnemonic: go straight back to the menu
+    if(mnemonic_only) return FlipBipStatusReturn;
+
+    // BIP39 seed
+    mnemonic_to_seed(w->mnemonic, passphrase_text, w->seed, 0);
+
+    // Scratch nodes live on the heap to keep the 3K app stack free for the crypto
+    HDNode* nodes = malloc(2 * sizeof(HDNode));
+    HDNode* node = &nodes[0];
+    HDNode* addr_node = &nodes[1];
+    const uint32_t xprv_vers = COIN_INFO_ARRAY[coin_type][COIN_INFO_XPRV_VERS];
+    const uint32_t xpub_vers = COIN_INFO_ARRAY[coin_type][COIN_INFO_XPUB_VERS];
+    uint32_t fingerprint = 0;
+
+    // m
+    hdnode_from_seed(w->seed, 64, SECP256K1_NAME, node);
+    hdnode_serialize_private(node, fingerprint, xprv_vers, w->xprv_root, XKEY_BUF);
+
+    // m/purpose' (44, or 84 for native SegWit)
+    hdnode_private_ckd_prime(node, COIN_INFO_ARRAY[coin_type][COIN_INFO_PURPOSE]);
+    // m/purpose'/coin'
+    hdnode_private_ckd_prime(node, COIN_INFO_ARRAY[coin_type][COIN_INFO_BIP44_COIN]);
+    // m/purpose'/coin'/0'
+    fingerprint = hdnode_fingerprint(node);
+    hdnode_private_ckd_prime(node, DERIV_ACCOUNT);
+    const bool xmr = flipbip_coin_fmt(coin_type) == CoinTypeXMR128;
+    if(!xmr) {
+        // (for XMR this space holds the 25 word seed instead)
+        hdnode_serialize_private(node, fingerprint, xprv_vers, w->xprv_account, XKEY_BUF);
+        // private_ckd leaves public_key stale: recompute before serializing the xpub
+        hdnode_fill_public_key(node);
+        hdnode_serialize_public(node, fingerprint, xpub_vers, w->xpub_account, XKEY_BUF);
+    }
+
+    // m/purpose'/coin'/0'/0
+    fingerprint = hdnode_fingerprint(node);
+    hdnode_private_ckd(node, DERIV_CHANGE);
+    if(xmr) {
+        flipbip_scene_1_init_xmr(w, addr_node, node, coin_type);
+    } else {
+        hdnode_serialize_private(node, fingerprint, xprv_vers, w->xprv_extended, XKEY_BUF);
+        hdnode_fill_public_key(node);
+        hdnode_serialize_public(node, fingerprint, xpub_vers, w->xpub_extended, XKEY_BUF);
+    }
+
+    // Receive addresses m/purpose'/coin'/0'/0/i, each also saved as a QR code file
+    char file_name[LINE_BUF];
+    for(uint32_t a = 0; a < NUM_ADDRS; a++) {
+        if(!xmr) {
+            flipbip_scene_1_init_address(w->recv_addresses[a], addr_node, node, coin_type, a);
+        }
+        snprintf(
+            file_name,
+            sizeof(file_name),
+            "%s%02lx%s",
+            COIN_TEXT_ARRAY[coin_type][COIN_TEXT_FILE],
+            (unsigned long)a,
+            TEXT_QRFILE_EXT);
+        flipbip_save_qrfile(
+            COIN_TEXT_ARRAY[coin_type][COIN_TEXT_NAME], w->recv_addresses[a], file_name);
+    }
+
+    memzero(nodes, 2 * sizeof(HDNode));
+    free(nodes);
+
+#if USE_BIP39_CACHE
+    bip39_cache_clear();
+#endif
+
+    return FlipBipStatusSuccess;
+}
+
+/* ---------------------------------------------------------------------------
+ * View callbacks (app thread)
+ * ------------------------------------------------------------------------- */
+
+static bool flipbip_scene_1_input(InputEvent* event, void* context) {
+    furi_assert(context);
+    FlipBipScene1* instance = context;
+
+    if(event->type != InputTypeRelease) return true;
+
+    if(event->key == InputKeyBack) {
+        // Never call out of the view while holding the model lock
+        instance->callback(FlipBipCustomEventScene1Back, instance->context);
+        return true;
+    }
+
+    int step = 0;
+    if(event->key == InputKeyDown || event->key == InputKeyRight) step = 1;
+    if(event->key == InputKeyUp || event->key == InputKeyLeft) step = -1;
+    if(step == 0) return true;
+
+    with_view_model(
+        instance->view,
+        FlipBipScene1Model * model,
+        {
+            // Only page through a fully derived wallet (not loading/error)
+            if(model->wallet && model->page >= PAGE_INFO && model->page <= PAGE_ADDR_END) {
+                model->page += step;
+                if(model->page > PAGE_ADDR_END) model->page = PAGE_INFO;
+                if(model->page < PAGE_INFO) model->page = PAGE_ADDR_END;
+            }
+        },
+        true);
+    return true;
+}
+
+static void flipbip_scene_1_enter(void* context) {
+    furi_assert(context);
+    FlipBipScene1* instance = context;
+    FlipBip* app = instance->context;
+
+    // BIP39 strength setting
+    int strength = 256; // 24 words
+    if(app->bip39_strength == FlipBipStrength128) {
+        strength = 128; // 12 words
+    } else if(app->bip39_strength == FlipBipStrength192) {
+        strength = 192; // 18 words
+    }
+
+    // BIP39 passphrase setting
+    const bool has_passphrase = app->passphrase == FlipBipPassphraseOn &&
+                                strlen(app->passphrase_text) > 0;
+    const char* passphrase_text = has_passphrase ? app->passphrase_text : "";
+
+    const uint32_t coin_type = app->coin_type;
+    const bool overwrite = app->overwrite_saved_seed != 0;
+
+    // Publish the loading screen and release the lock so the GUI can draw it
+    with_view_model(
+        instance->view,
+        FlipBipScene1Model * model,
+        {
+            model->page = PAGE_LOADING;
+            model->coin_type = coin_type;
+            model->warn_insecure = !has_passphrase;
+            model->warn_legacy = app->enclave_available &&
+                                 app->encryption == FlipBipEncryptionLegacy;
+            model->derivation_text = overwrite ? TEXT_NEW_WALLET :
+                                                 COIN_TEXT_ARRAY[coin_type][COIN_TEXT_DERIV];
+            model->error = NULL;
+            model->wallet = NULL;
+        },
+        true);
+
+    // Slow part: PBKDF2, BIP32 derivation, file I/O. No lock held.
+    FlipBipWallet* wallet = malloc(sizeof(FlipBipWallet));
+    memzero(wallet, sizeof(FlipBipWallet));
+    const FlipBipStatus status = flipbip_wallet_init(
+        wallet,
+        strength,
+        coin_type,
+        overwrite,
+        passphrase_text,
+        app->encryption,
+        app->enclave_available);
+
+    if(status == FlipBipStatusReturn) {
+        // New mnemonic generated and saved, go back to the menu
+        flipbip_suggest_enclave(app);
+        flipbip_wallet_free(wallet);
+        instance->callback(FlipBipCustomEventScene1Back, instance->context);
+        return;
+    }
+
+    const char* error = NULL;
+    if(status == FlipBipStatusSaveError) {
+        error = "Save error";
+    } else if(status == FlipBipStatusLoadError) {
+        error = "Load error";
+    } else if(status == FlipBipStatusMnemonicCheckError) {
+        error = "Mnemonic check error";
+    } else if(status == FlipBipStatusEnclaveError) {
+        error = "Needs Secure Enclave";
+    }
+    if(error) {
+        flipbip_wallet_free(wallet);
+        wallet = NULL;
+    }
+
+    // Publish the result in one short critical section
+    with_view_model(
+        instance->view,
+        FlipBipScene1Model * model,
+        {
+            model->wallet = wallet;
+            model->error = error;
+            model->page = error ? PAGE_ERROR : PAGE_INFO;
+        },
+        true);
+}
+
+static void flipbip_scene_1_exit(void* context) {
+    furi_assert(context);
+    FlipBipScene1* instance = context;
+    FlipBipWallet* wallet = NULL;
+
+    // Detach the wallet under the lock; no redraw, this view is going away
+    with_view_model(
+        instance->view,
+        FlipBipScene1Model * model,
+        {
+            wallet = model->wallet;
+            model->wallet = NULL;
+            model->error = NULL;
+            model->page = PAGE_LOADING;
+        },
+        false);
+
+    // The GUI thread can no longer reach it, safe to wipe outside the lock
+    flipbip_wallet_free(wallet);
+}
+
+FlipBipScene1* flipbip_scene_1_alloc(void) {
+    FlipBipScene1* instance = malloc(sizeof(FlipBipScene1));
+    instance->view = view_alloc();
+    view_allocate_model(instance->view, ViewModelTypeLocking, sizeof(FlipBipScene1Model));
+    view_set_context(instance->view, instance);
+    view_set_draw_callback(instance->view, flipbip_scene_1_draw);
+    view_set_input_callback(instance->view, flipbip_scene_1_input);
+    view_set_enter_callback(instance->view, flipbip_scene_1_enter);
+    view_set_exit_callback(instance->view, flipbip_scene_1_exit);
+    return instance;
+}
+
+void flipbip_scene_1_free(FlipBipScene1* instance) {
+    furi_assert(instance);
+    FlipBipWallet* wallet = NULL;
+    with_view_model(
+        instance->view,
+        FlipBipScene1Model * model,
+        {
+            wallet = model->wallet;
+            model->wallet = NULL;
+        },
+        false);
+    flipbip_wallet_free(wallet);
+    view_free(instance->view);
+    free(instance);
+}
+
+View* flipbip_scene_1_get_view(FlipBipScene1* instance) {
+    furi_assert(instance);
+    return instance->view;
+}

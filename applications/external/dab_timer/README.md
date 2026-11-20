@@ -1,0 +1,51 @@
+<h1 align="center"><a href='https://rogue-master.net'><img src="https://raw.githubusercontent.com/RogueMaster/flipperzero-firmware-wPlugins/420/.github/assets/rmlogo.png" width="40%"></a>
+<br><a href='https://discord.gg/gF2bBUzAFe' target='_blank'><img src="https://raw.githubusercontent.com/RogueMaster/flipperzero-firmware-wPlugins/420/.github/assets/Discord.png" alt='Discord' title='Discord'></a>
+&nbsp;<a href='https://github.com/RogueMaster/flipperzero-firmware-wPlugins/releases/latest' target='_blank'><img src="https://raw.githubusercontent.com/RogueMaster/flipperzero-firmware-wPlugins/420/.github/assets/Github.png"  alt='Firmware GitHub' title='Firmware GitHub'></a>
+&nbsp;<a href='https://www.patreon.com/RogueMaster?filters[tag]=Latest%20Release' target='_blank'><img src="https://raw.githubusercontent.com/RogueMaster/flipperzero-firmware-wPlugins/420/.github/assets/Patreon.png"  alt='Latest PATREON Release' title='Latest PATREON Release'></a>
+&nbsp;<a href='https://github.com/RogueMaster/awesome-flipperzero-withModules' target='_blank'><img src="https://raw.githubusercontent.com/RogueMaster/flipperzero-firmware-wPlugins/420/.github/assets/Resources.png"  alt='More Research / Assets' title='More Research / Assets'></a></h1>
+
+# Dab Timer / Clock (By RogueMaster)
+- We were the first clock created for Flipper Zero
+- Has 10 different clock faces
+- - Includes a circular clock face
+- - Includes a BINARY clock & timer
+- - Faces can be changed using the left button
+- Start/Stop timer using center button
+- Built in timer chime after 80 seconds (1 minute and 20 seconds)
+- - This timer preset length can be changed using up and down buttons
+- - Timer sound can be changed by pressing right button when timer is running.
+- Timer chime options:
+- - `S:Mario` - Super Mario Theme chime at timer preset and minute chime enabled.
+- - `S:ByMin` - Minute chime only.
+- - `S:OFF` - No chimes enabled.
+- - `S:PoRa` - Power Rangers Theme chime at timer preset and minute chime enabled.
+- - `S:Cont` - Repeat chime each minute after the timer preset.
+- Uses system time format settings
+
+## Controls
+
+| Control | Action |
+| --- | --- |
+| Left before starting a timer | Cycle all ten faces: Pwn, Original, Original Small, Circle, Binary, then their inverted variants. |
+| Left after a timer has started | Reset elapsed time while keeping the current running/paused state. |
+| Hold Left | Stop and fully reset the timer, enabling face selection again. |
+| OK | Start, pause, or resume; ordinary timer toggling remains disabled while Game Mode is active. |
+| Up/Down while running | Adjust the preset in five-second steps, with no underflow or overflow. |
+| Right | Cycle OFF, ByMin, Mario, PoRa, and Cont; sequence-prefix keys retain their special handling. |
+| Back from an idle code state | First press clears the Easter egg and arms exit; the second press exits. |
+| Hold Back | Exit directly. |
+
+The sequence **Up, Up, Down, Down, Left, Right, Left, Right** retains the Game
+Mode toggle and animated Easter egg. Continuing with **Back, OK** forces Game
+Mode off, saves the setting, and retains success/rainbow/XP feedback.
+
+# Credits To:
+- [Original (By CompaqDisc)](https://gist.github.com/CompaqDisc/4e329c501bd03c1e801849b81f48ea61)
+- [12/24HR (By non-bin)](https://github.com/RogueMaster/flipperzero-firmware-wPlugins/pull/254)
+- [Refactoring (By GMMan)](https://github.com/RogueMaster/flipperzero-firmware-wPlugins/pull/256)
+- [Using Analog Clock (By scrolltex)](https://github.com/scrolltex/flipper_analog_clock)
+
+
+# If you want this app expanded to add a specific clock face, timer chime or other functionality, feel free to open a Pull Request with improvements. <br>All improvements are welcomed!
+
+# Have a clock idea and don't know how to code?<br>Feel free to submit your suggestions as an issue.

@@ -1,0 +1,19 @@
+Import("env")
+
+env.Append(
+    SDK_HEADERS=[
+        File("../../icons/assets_icons.h"),
+        File("cfw.h"),
+    ],
+    LINT_SOURCES=[
+        Dir("."),
+    ],
+)
+
+libenv = env.Clone(FW_LIB_NAME="cfw")
+libenv.ApplyLibFlags()
+
+sources = libenv.GlobRecursive("*.c")
+
+lib = libenv.BuildFirmwareLibrary(sources)
+Return("lib")

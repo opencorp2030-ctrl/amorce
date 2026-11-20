@@ -1,0 +1,176 @@
+## Main changes
+- Current API: 88.27
+- Apps: Build tag (**20nov2026**) - **Check out more Apps updates and fixes by following** [this link](https://github.com/xMasterX/all-the-plugins/commits/dev)
+- SubGHz: **New protocol - BelKorn, 118 bits, rolling code with no encryption, 36 bit serial, with custom buttons** - (Korn, BelGate, Furniteh and other rebrands; the frame carries no manufacturer field, so they all read as `BelKorn`)
+- SubGHz: **Add Manually: `BelKorn`**
+- SubGHz: **The read list names the system a multi-system protocol decoded, instead of the protocol - CAME, Nice FloR-S, Faac SLH and KeeLoq**
+- SubGHz: **DEA Mio sends back the discriminator the original remote sent, instead of always setting the overflow bits**
+- SubGHz: **DEA Mio asks for the discriminator in Advanced Add Manually and shows it as `Ds:`**
+- SubGHz: **Advanced Add Manually asks for TE where the protocol carries one - Princeton, ZKTeco and FAAC TM**
+- SubGHz: **Advanced Add Manually asks for the guard time after TE, where the protocol carries one - Princeton and ZKTeco**
+- SubGHz: **Add Manually has one entry per system, with the frequency and modulation picked in the next screen**
+- SubGHz: **The band picker lists the system's own frequencies first and every other one below, so an odd installation can still be crafted**
+- SubGHz: **`More` on a saved RAW file now has an `Edit` entry that opens it straight in Sub-GHz RAW Edit and returns to Sub-GHz when you leave the editor** (by @Lechnio | PR #1221)
+- Apps: **Sub-GHz RAW Edit ships with the firmware now** - it is no longer part of the extra pack (by [Lechnio](https://github.com/Lechnio/SubGHz-RAW-Edit))
+- Apps: **New app - SIM800, drives a SIM800 GSM module over the GPIO UART: voice calls, SMS, a phonebook of numbers and SMS presets, and the module's network, inbox, USSD, DTMF, audio and power commands** - `Apps -> GPIO -> SIM800`, see [wiring and powering](/documentation/SIM800.md)
+- Archive: **New `Phone` tab for the SIM800 phonebook - a `.phone` entry opens straight in the app**
+- BadUSB: **New `DUCKY_LANG` script command - a script picks its own keyboard layout from `badusb/assets/layouts/<name>.kl`, instead of every script running on the one layout set in the app** (the native `.kl` map is ASCII only, and a missing or invalid name falls back to the built-in en-US) (by @ANTONiO-eagle | PR #1224 | Closes #1218)
+## Other changes
+- OFW: fix: resolve PVS-Studio warnings reported on dev
+- NFC: **Fix third-party NFC apps reading the wrong NTAG/Ultralight pages (Weebo "Wrong password" on every amiibo) - the Ultralight AES fields no longer sit in the middle of `MfUltralightData`**
+- SubGHz: **Fix the read list beep going missing with `Delete old signals` on and memory full**
+- SubGHz: **A signal turned away by a full read list now buzzes with `Delete old signals` on too**
+- Remote Analyzer: **BelGate dropped from the app, it is a firmware Sub-GHz protocol now**
+- Remote Analyzer: **`How to use` lists the protocols the app decodes on its own**
+- SubGHz: **Advanced Add Manually key field is now as long as the protocol's bits, instead of padding it with `00` to 8 bytes**
+- SubGHz: **Fix Add Manually failing on FAAC TM - only Princeton carries a `Guard_time`, so writing one into every TE protocol broke it**
+- SubGHz: **`subghz rx`, `tx` and `tx_from_file` over the CLI work on the internal radio again, instead of stopping at `Device 0 failed to start`** (by @GodKimba | PR #1216 | Fixes #1215)
+- SubGHz: **Feron frames are verified against their checksum, instead of any 32 bits that fit the timings decoding as Feron** (by @Lechnio | PR #1219)
+- SubGHz: **A settings file from another firmware no longer hides whole groups of protocols in Read - only the bits the `Ignore` options own are kept from a saved `IgnoreFilter`** (by @Lechnio | PR #1220)
+- RFID: **Fix Gallagher writes to EM4305 being shifted by one bit, so the written tag did not read back** (by @Firat17aze | PR #1217)
+- SubGHz: **`Signal settings` and `Radio settings` ship as embedded `.fal` plugins, so their scenes are only resident while the page is open** (by @Lechnio | PR #1222)
+- SubGHz: **Two more frequencies in the default list - 317.0 and 336.1 MHz**
+<br><br>
+
+----
+
+### Added:
+- Apps:
+  - Games: Checkers (by @H4W9)
+  - GPIO: CAN Commander (by @MatthewKuKanich)
+  - NFC:
+    - ISO 15693-3 NFC Writer (by @ch4istO)
+    - UL-C Bruteforce (by @noproto)
+    - UL-C Relay (by @noproto)
+    - ULCFkey (by @noproto)
+  - Sub-GHz: ProtoPirate (by @RocketGod-git & @xMasterX & @zero-mega et al.)
+  - Tools: Flipper Wedge (by @dangerous-tac0s)
+- Sub-GHz:
+  - UL: Add support for 42+ Keeloq based systems (with partial Add Manually support) (by @zero-mega, @xMasterX, ARF Team)
+  - UL: Cardin S449 protocol full support (64bit keeloq) (with Add manually, and all button codes) (use FSK12K modulation to read the remote) (by @xMasterX & @zero-mega)
+  - UL: Beninca ARC AES128 protocol full support (128bit dynamic) (with Add manually, and 2 button codes) (by @xMasterX & @zero-mega)
+  - UL: Jarolift protocol full support (72bit dynamic) (with Add manually, and all button codes) (by @xMasterX & d82k & Steffen (bastelbudenbuben de))
+  - UL: Treadmill37 protocol support (37bit static) (by @xMasterX)
+  - UL: Ditec GOL4 protocol (with programming mode, button switch, add manually) (by @xMasterX & @zero-mega)
+  - UL: KeyFinder protocol (24bit static) (by @xMasterX & @mishamyte)
+  - UL: Nord ICE protocol (33 bits, Static) (by @xMasterX)
+  - UL: Allstar Firefly 318ALD31K protocol (18 bits, Static) (by @jlaughter)
+  - UL: Add CAME TOP44FGN support in CAME TWEE protocol (by @xMasterX)
+  - UL: New modulation FSK with 12KHz deviation (by @xMasterX)
+  - UL: KingGates Stylo 4k Add manually and button switch support and refactoring of encoder (by @xMasterX)
+  - UL: Stilmatic (R-Tech) 12bit discr. fix & button 9 support (two buttons hold simulation) (mapped on arrow keys) (by @xMasterX)
+  - UL: Sommer last button code 0x6 support (mapped on arrow keys) (by @xMasterX)
+  - UL: V2 Phoenix (Phox) added 2 counter modes support (docs updated) (by @xMasterX)
+  - UL: Add 390MHz and 430.5MHz to default hopper list (6 elements like in OFW) (works well with Hopper RSSI level set for your enviroment) (by @xMasterX)
+  - UL: Add signals button editor and real remote simulation (full signal transmit with just one click) (by @Dmitry422)
+  - UL: KeeLoq add counter mode 7 (sends 7 signals increasing counter with 0x3333 steps) - may bypass counter on some receivers! (by @xMasterX)
+  - UL: TX Power setting (by @LeeroysHub)
+  - UL: Somfy Keytis button switch and Add Manually support (by @xMasterX)
+  - UL: Genius Echo/Bravo add 2 buttons hold simulation (0xB btn code) (by @xMasterX)
+  - UL: Add all 0x0s and all 0xFs KeeLoq MF codes for normal and simple learning (by @xMasterX)
+  - UL: Better support for CAME Atomo type remotes (TOPD4REN) (decode + button codes) (by @xMasterX & Roman)
+- NFC:
+  - Add Mifare Ultralight C Write Support (#524 by @haw8411)
+  - UL: Add ISO15693-3 and SLIX write-back support (by @DoniyorI)
+  - UL: Add new parsers SZPPK, SKPPK and SevPPK, upgrade Plantain parser, fix TwoCities parser (by @mxcdoam)
+- OFW PR 4343: RFID: Add Indala 224-bit (long format) protocol support (by @kuzaxak)
+- UL: JS: Add IR capabilities to the JS engine (by @LuisMayo)
+- FBT: Allow apps to specify custom cflags (by @WillyJL)
+- UL: Docs: Add [full list of supported SubGHz protocols](https://github.com/Next-Flip/Momentum-Firmware/blob/dev/documentation/SubGHzSupportedSystems.md) and their frequencies/modulations that can be used for reading remotes (by @xMasterX)
+UL: API: Add `canvas_get_buffer`, `canvas_get_buffer_size` to public API (by @xMasterX)
+
+### Updated:
+- Apps:
+  - XERO: MFKey: 4.1 with 40% faster key recovery, improved memory efficiency (by @dchristle), new SEN dictionary for 10x faster recovery (by @noproto)
+  - UL: Update Sub-GHz apps for FM12K modulation (by @xMasterX)
+  - UL: USB/BT Remote: PTT improvements (by @hryamzik)
+  - Ami Tool: Remove copyrighted names, write card fully using low level poller (by @Firefox2100)
+  - CAN Tools: Parity with DBC format, support importing DBC files (by @MatthewKuKanich)
+  - ESP Flasher: Bump Marauder 1.14.3 (by @justcallmekoko) FlipperHTTP 2.1.1 (by @jblanked) Blackmagic 0.1.2-rc (by @hedger), quick flash fix (by @xMasterX), advanced flashing mode (by @H4W9)
+  - ESP32 WiFi Marauder: Marauder 1.12.0 support (by @pfefferle), Marauder 1.10.0 support (by @justcallmekoko), Marauder 1.9.0 support (by @H4W9)
+  - FlipLibrary: Added Fahrenheit, current weather, and wind speed/direction (by @H4W9)
+  - FlipSocial: Autocomplete, keyboard improvements, explore and profile view enhancements, bugfixes (by @jblanked)
+  - FlipWeather: Added Fahrenheit, current weather, and wind speed/direction, custom location option (by @H4W9)
+  - Free Roam: Minimap, code optimization, ux improvements, online mode, option to hide/show player (by @jblanked)
+  - Flipper Blackhat: TUI command (by @o7-machinehum)
+  - Geometry Dash: Major refactor, bugfixes and performance improvements, rename from Geometry Flip (by @gooseprjkt)
+  - GhostESP: Many bugfixes, added Flock Detection, Flock List, and Stop Flock Detection commands (by @jaylikesbunda)
+  - HC-SR04 Distance Sensor: Option to change measure units (by @Tyl3rA)
+  - IconEdit: Save/Send animations, settings tab with canvas scale and cursor guides, bugfixes (by @rdefeo)
+  - INA2xx INA Meter: Fixed application freezing when the sensor is not connected (by @cepetr)
+  - KT0803 FM Transmitter: Many bugfixes (by @nixvio64)
+  - Lidar Emulator: Settings menu with external output and 5V power on support, separate thread for timing the infrared signal (by @ANTodorov)
+  - Lidar Emulator: Support external IR boards (by @ANTodorov)
+  - Metroflip: Bugfixes (by @baalpeteor2)
+  - NearbyFiles: GPS Baudrate selection, Ability to add GPS to file (by @xMasterX)
+  - NFC Login: Code refactor, bugfixes, renamed from NFC PC Login, restore BLE profile on app exit (by @Play2BReal)
+  - Passy: Bugfixes, Save advanced files as well (by @bettse)
+  - Picopass: Option to Create credential without a card (by @redteamlife), info screen improvements, allow Emulation of NRMAC dumped cards, Clean MKF option (by @bettse)
+  - Seader: SAM ATR3 support, better IFSC/IFSD handling, various improvements (by @bettse), reverse engineered U90 packet, SNMP support, multi-card selection, memory optimization, refactoring (by @cindersocket)
+  - Seos Compatible: Seos write support, various improvements (by @aaronjamt), support switching key sets (by @pcunning), code refactoring, various bugfixes (by @bettse)
+  - Sub-GHz Scheduler: Added new interval times, bugfixes and improvements (by @shalebridge)
+  - Tetris: Various bugfixes (by @Bricktech2000)
+  - Unitemp: Numerous improvements from @MLAB-project fork (by @MLAB-project), Many changes, new sensors and code refactoring in v2.0 (by @quen0n)
+  - Weebo: Cycle between .nfc files in the same directory (by @sethgregory), new figure IDs (by @Brickleberry19), bugfixes and refactoring (by @bettse)
+  - XRemote: Add dolphin xp and crash bugfix (by @teohumeau)
+  - Yatzee: Fix Full House calculation, improve code readability (by @zessx)
+- Sub-GHz:
+  - Sub-GHz app is now external on SD card, like on OFW (by @WillyJL)
+    - This was done to free some space on flash, which is always running out
+    - It means RAM consumption while using the Sub-GHz app has increased
+    - Usability remains mostly unaffected, our testing showed it can receive up to ~50 signals normally and ~10 signals with qFlipper / Flipper Mobile App connected
+    - You may experience some "out of memory" messages, this is inevitable as RAM eventually fragments and needs to be rearraged, simply resume as normal after the reboot
+  - Add Manually menu transparently refactored into a "separate app" for lower RAM usage, it is still accessed as before from Sub-GHz app (by @WillyJL)
+  - UL: Counter editor refactoring (by @Dmitry422)
+  - UL: Alutech AT-4N & Nice Flor S turbo speedup (by @Dmitry422)
+  - UL: Sommer fm2 in Add manually now uses FM12K modulation (Sommer without fm2 tag uses FM476) (try this if regular option doesn't work for you) (by @xMasterX)
+  - UL: Replaced Cars ignore option with Revers RB2 protocol ignore option (by @xMasterX)
+  - UL: Improve docs on low level code (by @Dmitry422)
+  - UL: KeeLoq display decrypted `Hop` instead of showing encrypted as is (encrypted non byte reversed hop is still displayed in `Key` field) (by @xMasterX)
+  - UL: BFT KeeLoq try decoding with zero seed too (by @xMasterX)
+  - UL: KeeLoq display BFT programming mode TX (when arrow button is held) (by @xMasterX)
+  - UL: Signal Settings Improvements (by @Dmitry422)
+  - UL: KeeLoq change delta size (by @xMasterX)
+- Archive: Support opening and pinning ProtoPirate files from Archive (#510 by @LeeroysHub)
+- Display: Extend lcd contrast range to -10 to +18 (by @ShaTie)
+- OFW PR 4297: RFID: Make FDX-B readout more descriptive (by @snowsign)
+- OFW PR 4320: API: Make `view_port_send_to_back()` public (by @loftyinclination)
+
+### Fixed:
+- Sub-GHz:
+  - Fix display of memory full (by @WillyJL)
+  - UL: Fixed button mapping for FAAC RC/XT (by @xMasterX)
+  - UL: Possible Sommer timings fix (by @xMasterX)
+  - UL: Various fixes and cleanup (by @xMasterX)
+  - UL: Nice Flor S remove extra uint64 variable (by @xMasterX)
+  - UL: Fix Alutech AT4N false positives (by @xMasterX)
+  - UL: Fix documentation link for HT12A protocol (by @carlogrisetti)
+  - UL: BFT Mitto fix decode bug (seed was not resetting after one successful decode) (by @xMasterX)
+  - UL: KeeLoq fix display of AN-Motors and HCS101 keys (by @xMasterX)
+  - UL: Fix CAME TWEE repeats count for button click (by @xMasterX)
+  - UL: Fix small logic error in KingGatesStylo4k protocol (by @xMasterX & @X-Stuff)
+  - UL: Improve Nice FLO decoding (by @xMasterX & Roman)
+  - UL: Fix duplicate code in RAW protocol (by @xMasterX)
+  - UL: Fix FAAC SLH wrong decode/encode, apply little code cleanup (by @xMasterX)
+- NFC:
+  - Fix sending 32+ byte ISO 15693-3 commands (by @WillyJL)
+  - Fixes to `READ_MULTI` and `GET_BLOCK_SECURITY` commands in ISO 15693-3 emulation (#501 by @WillyJL & aaronjamt)
+  - Fix Type 4 Tag read edge case for cards not supporting specific EF in DF select mode (by @WillyJL)
+  - Fix CLI with NTAG4xx and Type 4 Tag support (by @WillyJL)
+  - UL: Fix LED not blinking at SLIX unlock (by @xMasterX)
+  - UL: Fix "MIR" and other EMV cards crash on Read (by @Dmitry422)
+  - OFW PR 4362: Fix BusFault in Write to Initial Card (by @akrylysov)
+  - OFW PR 4369: Fix stack buffer overflows in MFUL FAST_READ and DESFire file settings parsers (by @qp-x-qp)
+- GUI: Optimize RAM usage of FileBrowser (by @WillyJL)
+- Archive: Fix wrong cursor when opening dirs with more than 220 files (by @WillyJL)
+- uFBT: Fix .clangd config for IDEs besides VSCode (by @WillyJL)
+- UL: Settings: Storage settings exit scenes properly if used via favourites (by @xMasterX)
+- UL: UI: Some small changes (by @xMasterX)
+- OFW PR 4364: JS: Address utf8 support when uploading JavaScript application (by @bekindpleaserewind)
+- OFW PR 4338: USB: Fix USB HID keyboard LED state reporting (by @Caballosanex)
+
+### Removed:
+- Sub-GHz:
+  - Removed Starline, ScherKhan and Kia protocols from main Sub-GHz app, they can be decoded with `Apps > Sub-GHz > ProtoPirate` external app
+  - Disabled X10 and Hormann Bisecur protocols due to flash space constraints and very limited usefulness, Momentum now has the same protocol list as Unleashed
+- Desktop: Removed winter holidays anims

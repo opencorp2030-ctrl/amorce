@@ -1,0 +1,515 @@
+#pragma once
+
+#include "subghz_types.h"
+
+#include <lib/subghz/subghz_worker.h>
+#include <lib/subghz/subghz_setting.h>
+#include <lib/subghz/receiver.h>
+#include <lib/subghz/transmitter.h>
+#include <lib/subghz/protocols/raw.h>
+#include <lib/subghz/devices/devices.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct SubGhzTxRx SubGhzTxRx;
+
+typedef void (*SubGhzTxRxNeedSaveCallback)(void* context);
+
+/** What one allocation costs on top of what it asks for: the allocator header, rounded up
+ * to the alignment. The largest free block is reported with that header counted in, and a
+ * request spends it out of the block it lands in, so a free block of exactly N bytes
+ * cannot serve a request for N. It has to be this and not a byte more, or the block handed
+ * back after a send reads as too small to take again - every size here is a multiple of
+ * the alignment, so no rounding is left to do */
+#define SUBGHZ_TX_BLOCK_OVERHEAD 8
+
+/** Free block a send needs when the protocol is not one of the few that reserve more.
+ * The largest of the rest is Power Smart at 1040 timings of 4 bytes,
+ * then CAME Atomo at 1024 and Beninca ARC at 800 */
+#define SUBGHZ_TX_MIN_FREE_BLOCK_DEFAULT SUBGHZ_TX_MIN_BLOCK
+
+/** Block a send of this protocol needs in one piece
+ *
+ * @param   protocol  protocol name as stored with the signal
+ * @return  size in bytes
+ */
+size_t subghz_txrx_tx_block_need(const char* protocol);
+
+/** Hold a send block of this size, growing or shrinking what is already held. The history
+ * calls this with the widest need among the signals it keeps, so every one of them stays
+ * sendable without reserving for protocols that are not there
+ *
+ * @param   need  size in bytes, from subghz_txrx_tx_block_need()
+ * @return  false when no such block exists, and the previous one is kept
+ */
+bool subghz_txrx_tx_block_reserve(size_t need);
+
+/** Size of the send block currently held, 0 when none is
+ *
+ * @return  size in bytes
+ */
+size_t subghz_txrx_tx_block_size(void);
+
+typedef enum {
+    SubGhzTxRxStartTxStateOk,
+    SubGhzTxRxStartTxStateErrorOnlyRx,
+    SubGhzTxRxStartTxStateErrorParserOthers,
+    SubGhzTxRxStartTxStateErrorMemory,
+} SubGhzTxRxStartTxState;
+
+#define SUBGHZ_TX_MIN_HEAP      (8u * 1024u)
+#define SUBGHZ_TX_MIN_BLOCK     (5u * 1024u)
+#define SUBGHZ_TX_MIN_HEAP_RAW  (14u * 1024u)
+// RAW streaming allocates two large contiguous buffers (stream ~4 KB and the
+// pre-reserved line buffer ~4.6 KB). Require the largest free block to hold both
+#define SUBGHZ_TX_MIN_BLOCK_RAW (9u * 1024u)
+
+size_t subghz_txrx_get_tx_min_heap_required(SubGhzTxRx* instance);
+
+/**
+ * Allocate SubGhzTxRx
+ * 
+ * @return SubGhzTxRx* pointer to SubGhzTxRx
+ */
+SubGhzTxRx* subghz_txrx_alloc(void);
+
+/**
+ * Free SubGhzTxRx
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ */
+void subghz_txrx_free(SubGhzTxRx* instance);
+
+/** Configure the external module LEDs/amp; takes effect immediately while idle. */
+void subghz_txrx_set_ext_leds_and_amp(SubGhzTxRx* instance, bool enabled);
+
+/**
+ * Check if the database is loaded
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @return bool True if the database is loaded
+ */
+bool subghz_txrx_is_database_loaded(SubGhzTxRx* instance);
+
+/**
+ * Set preset 
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param preset_name Name of preset
+ * @param frequency Frequency in Hz
+ * @param latitude Latitude in float
+ * @param longitude Longitude in float
+ * @param preset_data Data of preset
+ * @param preset_data_size Size of preset data
+ */
+void subghz_txrx_set_preset(
+    SubGhzTxRx* instance,
+    const char* preset_name,
+    uint32_t frequency,
+    float latitude,
+    float longitude,
+    uint8_t* preset_data,
+    size_t preset_data_size);
+
+/**
+ * Set TX Power
+ * 
+ * @param preset_data Data of preset
+ * @param preset_data_size Size of preset data
+ * @param tx_power Menu Index of TX Power Setting. (Saves iterating in Config enter)
+ */
+uint8_t* subghz_txrx_set_tx_power(uint8_t* preset_data, size_t preset_data_size, uint8_t tx_power);
+
+/**
+ * Get name of preset
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param preset String of preset 
+ * @return const char*  Name of preset
+ */
+const char* subghz_txrx_get_preset_name(SubGhzTxRx* instance, const char* preset);
+
+/**
+ * Get of preset
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @return SubGhzRadioPreset Preset
+ */
+SubGhzRadioPreset subghz_txrx_get_preset(SubGhzTxRx* instance);
+
+/**
+ * Get string frequency and modulation
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param frequency Pointer to a string frequency
+ * @param modulation Pointer to a string modulation
+ */
+void subghz_txrx_get_frequency_and_modulation(
+    SubGhzTxRx* instance,
+    FuriString* frequency,
+    FuriString* modulation,
+    bool long_name);
+
+/**
+ * Get latitude value
+ *
+ * @param instance Pointer to a SubGhzTxRx
+ * @return latitude
+*/
+float subghz_txrx_get_latitude(SubGhzTxRx* instance);
+
+/**
+ * Get longitude value
+ *
+ * @param instance Pointer to a SubGhzTxRx
+ * @return longitude
+*/
+float subghz_txrx_get_longitude(SubGhzTxRx* instance);
+
+/**
+ * Start TX CC1101
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param flipper_format Pointer to a FlipperFormat
+ * @return SubGhzTxRxStartTxState 
+ */
+SubGhzTxRxStartTxState subghz_txrx_tx_start(SubGhzTxRx* instance, FlipperFormat* flipper_format);
+
+/**
+ * Start RX CC1101
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ */
+void subghz_txrx_rx_start(SubGhzTxRx* instance);
+
+/**
+ * Stop TX/RX CC1101
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ */
+void subghz_txrx_stop(SubGhzTxRx* instance);
+
+/**
+ * Set sleep mode CC1101
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ */
+void subghz_txrx_sleep(SubGhzTxRx* instance);
+
+/**
+ * Update frequency CC1101 in automatic mode (hopper)
+ *
+ * Call subghz_txrx_radio_device_poll_active() earlier in the same scene tick.
+ * Hopping is the hot path and does not probe by itself; skipping that check
+ * would keep hopping an external module that has been unplugged.
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param stay_threshold RSSI theshold over which to stay before hopping
+ */
+void subghz_txrx_hopper_update(SubGhzTxRx* instance, float stay_threshold);
+
+/**
+ * Get state hopper
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @return SubGhzHopperState 
+ */
+SubGhzHopperState subghz_txrx_hopper_get_state(SubGhzTxRx* instance);
+
+/**
+ * Set state hopper
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param state State hopper
+ */
+void subghz_txrx_hopper_set_state(SubGhzTxRx* instance, SubGhzHopperState state);
+
+/**
+ * Unpause hopper
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ */
+void subghz_txrx_hopper_unpause(SubGhzTxRx* instance);
+
+/**
+ * Set pause hopper
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ */
+void subghz_txrx_hopper_pause(SubGhzTxRx* instance);
+
+/**
+ * Speaker on
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ */
+void subghz_txrx_speaker_on(SubGhzTxRx* instance);
+
+/**
+ * Speaker off
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ */
+void subghz_txrx_speaker_off(SubGhzTxRx* instance);
+
+/**
+ * Speaker mute
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ */
+void subghz_txrx_speaker_mute(SubGhzTxRx* instance);
+
+/**
+ * Speaker unmute
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ */
+void subghz_txrx_speaker_unmute(SubGhzTxRx* instance);
+
+/**
+ * Set state speaker
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ * @param state State speaker
+ */
+void subghz_txrx_speaker_set_state(SubGhzTxRx* instance, SubGhzSpeakerState state);
+
+/**
+ * Get state speaker
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ * @return SubGhzSpeakerState 
+ */
+SubGhzSpeakerState subghz_txrx_speaker_get_state(SubGhzTxRx* instance);
+
+/**
+ * load decoder by name protocol
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param name_protocol Name protocol
+ * @return bool True if the decoder is loaded 
+ */
+bool subghz_txrx_load_decoder_by_name_protocol(SubGhzTxRx* instance, const char* name_protocol);
+
+/**
+ * Get decoder
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @return SubGhzProtocolDecoderBase* Pointer to a SubGhzProtocolDecoderBase
+ */
+SubGhzProtocolDecoderBase* subghz_txrx_get_decoder(SubGhzTxRx* instance);
+
+/**
+ * Set callback for save data
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param callback Callback for save data
+ * @param context Context for callback
+ */
+void subghz_txrx_set_need_save_callback(
+    SubGhzTxRx* instance,
+    SubGhzTxRxNeedSaveCallback callback,
+    void* context);
+
+/**
+ * Get pointer to a load data key
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @return FlipperFormat* 
+ */
+FlipperFormat* subghz_txrx_get_fff_data(SubGhzTxRx* instance);
+
+/**
+ * Get pointer to a SugGhzSetting
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @return SubGhzSetting* 
+ */
+SubGhzSetting* subghz_txrx_get_setting(SubGhzTxRx* instance);
+
+/**
+ * Is it possible to save this protocol
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ * @return bool True if it is possible to save this protocol
+ */
+bool subghz_txrx_protocol_is_serializable(SubGhzTxRx* instance);
+
+/**
+ * Is it possible to send this protocol
+ * 
+ * @param instance Pointer to a SubGhzTxRx 
+ * @return bool True if it is possible to send this protocol
+ */
+bool subghz_txrx_protocol_is_transmittable(SubGhzTxRx* instance, bool check_type);
+
+/**
+ * Set filter, what types of decoder to use 
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param filter Filter
+ */
+void subghz_txrx_receiver_set_filter(SubGhzTxRx* instance, SubGhzProtocolFlag filter);
+
+/**
+ * Set ignore filter, what types of decoder to skip 
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param ignore_filter Ignore filter
+ */
+void subghz_txrx_receiver_set_ignore_filter(
+    SubGhzTxRx* instance,
+    SubGhzProtocolFilter ignore_filter);
+
+/**
+ * Set callback for receive data
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param callback Callback for receive data
+ * @param context Context for callback
+ */
+void subghz_txrx_set_rx_callback(
+    SubGhzTxRx* instance,
+    SubGhzReceiverCallback callback,
+    void* context);
+
+/**
+ * Set callback for Raw decoder, end of data transfer  
+ * 
+ * @param instance Pointer to a SubGhzTxRx
+ * @param callback Callback for Raw decoder, end of data transfer 
+ * @param context Context for callback
+ */
+void subghz_txrx_set_raw_file_encoder_worker_callback_end(
+    SubGhzTxRx* instance,
+    SubGhzProtocolEncoderRAWCallbackEnd callback,
+    void* context);
+
+/* Checking if an external radio device is connected
+* 
+* @param instance Pointer to a SubGhzTxRx
+* @param name Name of external radio device
+* @return bool True if is connected to the external radio device
+*/
+bool subghz_txrx_radio_device_is_external_connected(SubGhzTxRx* instance, const char* name);
+
+/* Set the selected radio device to use
+* The radio must be stopped first. An active RX/TX selection request is ignored.
+* The return value describes the device that actually began, which may be the
+* internal fallback when an external module is unavailable.
+*
+* @param instance Pointer to a SubGhzTxRx
+* @param radio_device_type Radio device type
+* @return SubGhzRadioDeviceType Type of installed radio device
+*/
+SubGhzRadioDeviceType
+    subghz_txrx_radio_device_set(SubGhzTxRx* instance, SubGhzRadioDeviceType radio_device_type);
+
+/** Check an idle/sleeping selected external module and fall back if it is missing.
+ * Uses one status read for a live module and never searches from the internal
+ * radio. RX/TX entry calls this before any device-bound worker is created.
+ *
+ * @return true when the selected radio changes and the scene must redraw its status
+ */
+bool subghz_txrx_radio_device_poll(SubGhzTxRx* instance);
+
+/** Also search for a previously missing external module, at most once per 5 seconds.
+ * The power/self-test timeout can stall, so use only on the idle Sub-GHz menu.
+ * An explicit Internal selection disables both automatic fallback and reacquisition.
+ *
+ * @return true when the selected radio changes and the scene must redraw its status
+ */
+bool subghz_txrx_radio_device_poll_reacquire(SubGhzTxRx* instance);
+
+/** Check for an external module lost during RX, joining the worker before swapping.
+ * Restarts reception with the same preset and frequency on the radio that answered.
+ * Does not switch a running transmitter or search for a missing module during RX.
+ *
+ * @return true when the selected radio changes and the scene must redraw its status
+ */
+bool subghz_txrx_radio_device_poll_active(SubGhzTxRx* instance);
+
+/* Get the selected radio device to use
+*
+* @param instance Pointer to a SubGhzTxRx
+* @return SubGhzRadioDeviceType Type of installed radio device
+*/
+SubGhzRadioDeviceType subghz_txrx_radio_device_get(SubGhzTxRx* instance);
+
+/* Get RSSI the selected radio device to use
+*
+* @param instance Pointer to a SubGhzTxRx
+* @return float RSSI
+*/
+float subghz_txrx_radio_device_get_rssi(SubGhzTxRx* instance);
+
+/* Get name the selected radio device to use
+*
+* @param instance Pointer to a SubGhzTxRx
+* @return const char* Name of installed radio device
+*/
+const char* subghz_txrx_radio_device_get_name(SubGhzTxRx* instance);
+
+/* Get intelligence whether frequency the selected radio device to use
+*
+* @param instance Pointer to a SubGhzTxRx
+* @return bool True if the frequency is valid
+*/
+bool subghz_txrx_radio_device_is_frequency_valid(SubGhzTxRx* instance, uint32_t frequency);
+
+SubGhzTx subghz_txrx_radio_device_check_tx(SubGhzTxRx* instance, uint32_t frequency);
+
+void subghz_txrx_set_debug_pin_state(SubGhzTxRx* instance, bool state);
+bool subghz_txrx_get_debug_pin_state(SubGhzTxRx* instance);
+
+void subghz_txrx_reset_dynamic_and_custom_btns(SubGhzTxRx* instance);
+
+SubGhzReceiver* subghz_txrx_get_receiver(SubGhzTxRx* instance); // TODO use only in DecodeRaw
+
+/** Feed one sample to the decoders and count it against the air-time clock
+ *
+ * @param instance Pointer to a SubGhzTxRx
+ * @param level Sample level
+ * @param duration Sample duration, us
+ */
+void subghz_txrx_decode(SubGhzTxRx* instance, bool level, uint32_t duration);
+
+/** Get the total air decoded so far
+ *
+ * Only advances while samples are being handed to the decoders, so the
+ * difference between two readings is the air between two decoded frames and not
+ * the wall time between the moments the app was told about them
+ *
+ * @param instance Pointer to a SubGhzTxRx
+ * @return Air time, ms
+ */
+uint32_t subghz_txrx_get_air_time_ms(SubGhzTxRx* instance);
+
+/**
+ * @brief Set current preset AM650 without additional params
+ * 
+ * @param instance - instance Pointer to a SubGhzTxRx
+ * @param frequency - frequency of preset, if pass 0 then taking default frequency 433.92MHz
+ */
+void subghz_txrx_set_default_preset(SubGhzTxRx* instance, uint32_t frequency);
+
+/**
+ * @brief Set current preset by index
+ * 
+ * @param instance  - instance Pointer to a SubGhzTxRx
+ * @param frequency - frequency of new preset
+ * @param index - index of preset taken from SubGhzSetting
+ * @param tx_power - index of TX Power menu index option to use.
+ * @return const char* -  name of preset
+ */
+const char* subghz_txrx_set_preset_internal(
+    SubGhzTxRx* instance,
+    uint32_t frequency,
+    uint8_t index,
+    uint8_t tx_power);
+
+#ifdef __cplusplus
+}
+#endif

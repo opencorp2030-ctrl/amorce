@@ -1,0 +1,99 @@
+#pragma once
+
+#include "../archive_i.h"
+#include <storage/storage.h>
+#include <lfrfid/tools/t5577_file.h>
+
+#define TAB_LEFT          InputKeyLeft // Default tab switch direction
+#define TAB_DEFAULT       ArchiveTabFavorites // Start tab
+#define FILE_LIST_BUF_LEN 50
+
+static const char* const tab_default_paths[] = {
+    [ArchiveTabFavorites] = "/app:favorites",
+    [ArchiveTabIButton] = EXT_PATH("ibutton"),
+    [ArchiveTabNFC] = EXT_PATH("nfc"),
+    [ArchiveTabSubGhz] = EXT_PATH("subghz"),
+    [ArchiveTabLFRFID] = EXT_PATH("lfrfid"),
+    [ArchiveTabInfrared] = EXT_PATH("infrared"),
+    [ArchiveTabBadUsb] = EXT_PATH("badusb"),
+    [ArchiveTabPhone] = EXT_PATH("phonebook"),
+    [ArchiveTabU2f] = "/app:u2f",
+    [ArchiveTabApplications] = EXT_PATH("apps"),
+    [ArchiveTabSearch] = "/app:search",
+    [ArchiveTabDiskImage] = STORAGE_MNT_PATH_PREFIX,
+    [ArchiveTabInternal] = STORAGE_INT_PATH_PREFIX,
+    [ArchiveTabBrowser] = STORAGE_EXT_PATH_PREFIX,
+};
+
+extern const char* const known_ext[ArchiveFileTypePhone + 1];
+
+// Tab filters may contain multiple extensions; file types always describe one file.
+static const char* const tab_ext[] = {
+    [ArchiveTabFavorites] = "*",
+    [ArchiveTabIButton] = ".ibtn",
+    [ArchiveTabNFC] = ".nfc",
+    [ArchiveTabSubGhz] = ".sub",
+    [ArchiveTabLFRFID] = ".rfid|" T5577_FILE_EXTENSION,
+    [ArchiveTabInfrared] = ".ir",
+    [ArchiveTabBadUsb] = ".txt",
+    [ArchiveTabPhone] = ".phone",
+    [ArchiveTabU2f] = "?",
+    [ArchiveTabApplications] = ".fap|.js",
+    [ArchiveTabSearch] = "*",
+    [ArchiveTabDiskImage] = "*",
+    [ArchiveTabInternal] = "*",
+    [ArchiveTabBrowser] = "*",
+};
+
+static inline const char* archive_get_tab_ext(ArchiveTabEnum tab) {
+    return tab_ext[tab];
+}
+
+static inline const char* archive_get_default_path(ArchiveTabEnum tab) {
+    return tab_default_paths[tab];
+}
+
+static inline bool archive_is_known_app(ArchiveFileTypeEnum type) {
+    return type < ArchiveFileTypeUnknown || type == ArchiveFileTypeT5577 ||
+           type == ArchiveFileTypePhone;
+}
+
+void archive_file_browser_set_path(
+    ArchiveBrowserView* browser,
+    FuriString* path,
+    const char* filter_ext,
+    bool skip_assets,
+    bool hide_dot_files,
+    const char* override_home_path);
+bool archive_is_item_in_array(ArchiveBrowserViewModel* model, uint32_t idx);
+bool archive_is_file_list_load_required(ArchiveBrowserViewModel* model);
+void archive_update_offset(ArchiveBrowserView* browser);
+void archive_update_focus(ArchiveBrowserView* browser, const char* target);
+
+void archive_file_array_load(ArchiveBrowserView* browser, int8_t dir);
+size_t archive_file_get_array_size(ArchiveBrowserView* browser);
+bool archive_file_array_contains(ArchiveBrowserView* browser, const char* path);
+void archive_file_array_rm_selected(ArchiveBrowserView* browser);
+void archive_file_array_swap(ArchiveBrowserView* browser, int8_t dir);
+void archive_file_array_rm_all(ArchiveBrowserView* browser);
+
+void archive_set_item_count(ArchiveBrowserView* browser, uint32_t count);
+
+ArchiveFile_t* archive_get_current_file(ArchiveBrowserView* browser);
+/* The caller initializes and clears the copy. No pointer to the list escapes. */
+bool archive_copy_current_file(ArchiveBrowserView* browser, ArchiveFile_t* copy);
+ArchiveFile_t* archive_get_file_at(ArchiveBrowserView* browser, size_t idx);
+ArchiveTabEnum archive_get_tab(ArchiveBrowserView* browser);
+bool archive_is_home(ArchiveBrowserView* browser);
+const char* archive_get_name(ArchiveBrowserView* browser);
+
+void archive_add_app_item(ArchiveBrowserView* browser, const char* name);
+void archive_add_file_item(ArchiveBrowserView* browser, bool is_folder, const char* name);
+void archive_show_file_menu(ArchiveBrowserView* browser, bool show, bool manage);
+void archive_favorites_move_mode(ArchiveBrowserView* browser, bool active);
+
+void archive_set_tab(ArchiveBrowserView* browser, ArchiveTabEnum tab);
+void archive_switch_tab(ArchiveBrowserView* browser, InputKey key);
+void archive_enter_dir(ArchiveBrowserView* browser, FuriString* name);
+void archive_leave_dir(ArchiveBrowserView* browser);
+void archive_refresh_dir(ArchiveBrowserView* browser);

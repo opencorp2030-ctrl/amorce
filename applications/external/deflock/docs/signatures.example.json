@@ -1,0 +1,17 @@
+{
+  "ouis": [
+    "aa:bb:cc"
+  ],
+  "macs": [
+    "aa:bb:cc:dd:ee:ff"
+  ],
+  "ssid_confirmed": [
+    "example-confirmed-ssid"
+  ],
+  "ssid_likely": [
+    "example-likely-ssid"
+  ],
+  "ie_fps": [
+    "deadbeef"
+  ]
+}

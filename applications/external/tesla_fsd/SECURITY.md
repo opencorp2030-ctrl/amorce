@@ -1,0 +1,208 @@
+# Security & responsible use
+
+## Disclaimer
+
+> [!WARNING]
+> **Modifying CAN bus messages on a vehicle can cause dangerous behaviour
+> or permanently damage your car.** The CAN bus carries braking, steering,
+> airbag, and powertrain control signals. A malformed or out-of-spec frame
+> can have serious physical consequences.
+
+> [!WARNING]
+> **FSD is a premium Tesla feature and must be properly purchased or
+> subscribed to.** This project intercepts and modifies UI configuration
+> frames at the CAN bus level. It does not bypass any cryptographic
+> entitlement check on Tesla's servers, and using it without an active
+> subscription is a violation of Tesla's Terms of Service. Doing so is
+> your decision and your risk.
+
+> [!CAUTION]
+> **Tesla has begun issuing VIN-level bans** (confirmed April 2026,
+> issue #18). Affected vehicles lose the TLSSC toggle silently — no OTA
+> update, no warning. The ban persists across account transfers, FSD
+> re-subscriptions, and software reinstalls from Service. Pulling the
+> SIM card before use reduces but does not eliminate detection risk.
+>
+> **What we now know about the ban mechanism** (community research, April 2026):
+> - The ban downgrades `GTW_autopilot` tier from SELF_DRIVING (3) to ENHANCED (2) in `0x7FF` mux=2 byte[5] bits 4:2
+> - `0x3FD` mux=0 byte[4] bit 6 (bit 38, the TLSSC flag) is independently cleared. Bit 39 (byte[4] bit 7) is Continue on Green, not TLSSC
+> - `0x259 APP_fsdSuspendState` is set to SUSPENDED on banned cars
+> - The AP ECU's primary entitlement path appears to be **Ethernet** — shadow-injecting `0x7FF` alone does not override the ban. However, other CAN-side mechanisms DO affect AP behavior: **TLSSC Restore (0x331) + 0x3FD mux0 bit38** has been confirmed by @RoyRakete to reliably re-enable AP/TACC on banned HW3 / 2026.2.6 ([#18](https://github.com/hypery11/flipper-tesla-fsd/issues/18#issuecomment-4413430516))
+> - TLSSC Restore alone can partially recover stop sign / traffic light control on Palladium and HW4 platforms, but does NOT restore full FSD
+> - Ban enforcement is platform-specific: Intel HW3 is more aggressive than Palladium/HW4
+
+This project is published for testing, research, and educational purposes.
+It is intended for use on **private property** and **off public roads**
+unless and until you have your own legal opinion that operating it on a
+public road is permitted in your jurisdiction.
+
+The authors and contributors accept **no responsibility** for:
+- Damage to your vehicle, including warranty voiding
+- Personal injury or property damage
+- Tesla account suspension or service revocation
+- Violation of road traffic regulations in your country
+- Civil or criminal liability arising from any of the above
+
+If you don't fully understand what each setting does, **do not enable it
+on a vehicle that drives on a public road**.
+
+## Reporting a security issue
+
+If you find:
+- A way for this project to corrupt or destabilise a CAN bus beyond what
+  the documented behaviour does
+- An out-of-bounds read/write on the Flipper that could brick the device
+- A subtle frame interaction that could cascade into a vehicle safety
+  fault
+
+Please **do not** open a public GitHub issue. Email
+hypery11@gmail.com with the subject `[security] flipper-tesla-fsd` and
+describe the issue, the reproduction steps, and the affected version. I'll
+respond within a few days and credit you in the patch release notes if
+you'd like.
+
+For non-security bugs, the regular [issue tracker](https://github.com/hypery11/flipper-tesla-fsd/issues)
+is fine.
+
+## What this project does NOT touch
+
+For peace of mind, here is the explicit list of CAN ID classes this
+project's TX path can write to:
+
+- `0x3FD` `UI_autopilotControl` — sets or clears bits 19, 38, 39, 40-42,
+  45, 46, 47, 48, 50, 59, 60 (bit38 TLSSC, bit39 Continue on Green, bits
+  40-42 apmv3 branch/tier, bit45 lane graph, bits 48/50 cleared for
+  Telemetry Off), and writes the HW4 speed-profile field (mux2 bits 60-62,
+  leaving the bit-63 valid flag alone). On HW3 the speed-profile field
+  (mux0 bits 49-50) and speed-offset field (mux2 bits 6-13) are written
+  only with the ESP32 HW3 Speed Override setting on; by default the car's
+  own values pass through. Retransmits otherwise unchanged
+- `0x3EE` `UI_autopilotControl` (Legacy HW1/HW2) — bit 46 and the
+  speed-profile field (bits 49-50) on mux0, bit 19 cleared on mux1;
+  retransmits otherwise unchanged
+- `0x370` `EPAS3P_sysStatus` — sends a counter+1 echo with a synthetic
+  steering torque (capped at ±1.8 Nm) and handsOnLevel = 1 for the nag
+  killer (the EPAS-faithful mode leaves handsOnLevel as received); the
+  original frame from EPAS is not blocked
+- `0x399` `ISA_speedLimit` — sets bit 5 of byte 1 to suppress the chime;
+  recalculates the Tesla checksum
+- `0x082` `UI_tripPlanning` — periodic write of `0x05` in byte 0 to
+  trigger battery preconditioning, only when the user enables the
+  Precondition setting
+- `0x331` `DAS_autopilotConfig` — overwrites byte[0] lower 6 bits to
+  0x1B (SELF_DRIVING) for TLSSC Restore on banned vehicles; only when
+  the user enables the TLSSC Restore setting
+- `0x3F8` `UI_driverAssistControl` — Nav FSD Route (bits 13/48/49),
+  Hands-Off (bit14), Dev Mode (bit5), driving-side override — Force LHD /
+  RHD (bits 40-41), Telemetry Off (bits 19/42/43/44/55); only when the
+  corresponding Settings toggle is ON
+- `0x313` `UI_trackModeSettings` — when the Track Mode setting is ON,
+  requests Track Mode ON and writes the handling-balance / stability-assist
+  / cooling fields, then recomputes the additive checksum; the car's own
+  broadcast frame is modified in place
+- `0x334` `UI_powertrainControl` — ESP32 only, when the Acceleration Mode
+  setting is not Off: rewrites `UI_pedalMap` (byte 0 bits 5-6) in the car's
+  own frame, keeps the counter and recomputes the additive checksum. A new
+  mode is only applied at standstill (fresh `0x257` at or under 1 km/h, or
+  `0x118` gear P); Off, a paused TX gate or a touchscreen mode change while
+  driving go back to pass-through at once. Frames with a wrong DLC or bad
+  checksum are never touched. The touchscreen keeps showing the driver's own
+  mode. Idea from [ColinM-sys/tesla-can-boost](https://github.com/ColinM-sys/tesla-can-boost) ([#211](https://github.com/hypery11/flipper-tesla-fsd/issues/211))
+- `0x7FF` `GTW_carConfig` — replays the learned-healthy snapshot when
+  GTW Config Replay (formerly "Ban Shield") detects the gateway has
+  modified a frame; only when the feature is armed. Or, with Tier
+  Override on and Replay off, rewrites the mux=2 tier field (byte 5
+  bits 4:2) to SELF_DRIVING (Flipper only)
+- `0x3C2` `VCLEFT_switchStatus` — on mux=1 frames, runs a time-based
+  scroll-wheel engage gesture: holds `swcRightPressed` (bits 12-13)
+  ~250 ms, emits `swcRightScrollTicks` up (bits 24-29) ~150 ms, holds
+  `swcRightPressed` ~250 ms, then one final scroll-up. Only when the
+  ScrollPress AP setting is ON, op mode is Service, HW is detected as
+  HW4, and `DAS_autopilotState` has transitioned from UNAVAIL to AVAIL
+  since the last firing. Does not write to `0x3FD`
+- `0x3F5` `VCFRONT_lighting` — hazard request and wiper off, from the
+  Flipper Extras menu (BETA); Service mode only
+- `0x249` `SCCM_leftStalk` — generated high-beam strobe and turn-signal
+  frames, from the Flipper Extras menu (BETA); Service mode only
+- `0x229` `SCCM_rightStalk` — generated full-down double press for the
+  ESP32 **Continuous AP** option (HW3/Legacy, off by default)
+- **Send Test** (Flipper) — the frames in a user-authored `.cantest`
+  profile, any ID except `0x229`; see [docs/cantest-format.md](docs/cantest-format.md)
+
+It does NOT write to:
+
+- Brake controllers (`0x244` `IBST_status` and friends)
+- Steering controllers (`0x129` `SteeringAngle*`)
+- Powertrain (`0x118` `DI_systemStatus`, `0x132` BMS, `0x108` `DI_torque`).
+  `0x334` above is the touchscreen's request frame, not a drive-unit frame;
+  `0x118` and `0x257` are only read
+- ESP / stability control (`0x145` `ESP_status`)
+- Door / window / lock actuators (`0x102`, `0x3E3`)
+- Chassis-only control frames. Note the device transmits on whatever bus
+  it is wired to: on many harnesses X179 13/14 is Chassis CAN, and the
+  T-2CAN `can0` is wired there (see [HARDWARE.md](HARDWARE.md))
+
+The BMS, OTA detect, and follow-distance handlers are **read-only** parsers
+— they update internal state, they never call `send_can_frame()`.
+
+If you want to verify this for yourself, the dispatch is in
+`scenes/fsd_running.c` (Flipper) and `esp32/.firmware/main.cpp` (ESP32),
+and every TX call site is gated by `fsd_can_transmit(&state)` which
+honours Listen-Only mode, the OTA Guard (overridable on the ESP32 with
+Ignore OTA), and the in-car Autopark pause (all TX stops while the car
+runs Autopark, #180). The exception is Send Test, which has its own gate:
+it only transmits while a fresh `0x257` DI_speed frame shows the car
+stationary, re-checked before every frame.
+
+## Listen-Only mode
+
+Since v2.4 the app boots in `Listen-Only` mode by default. The MCP2515
+CAN controller is put into its hardware listen-only register, which is
+**physically incapable of TX even on bus error frames**. You have to make
+an explicit choice in Settings → Mode → Active before any frame leaves the
+controller.
+
+The ESP32 also starts in Listen-Only on first boot, but it saves the
+chosen mode in NVS, so a board left in Active comes back in Active. A
+factory reset returns it to Listen-Only.
+
+Use Listen-Only when you want to verify wiring, sniff traffic, or just be
+sure you're not perturbing the bus.
+
+## Recommended pre-flight
+
+Before each session:
+
+1. Disable cellular uplink — on cars with a physical SIM (some
+   pre-2024 builds), pull it from behind the glovebox. On cars with
+   eSIM (most 2024+ builds), disconnect the TCU modem (requires trim
+   removal) or park in a low-coverage area (underground garage,
+   metal-shielded structure). There is no user-facing "airplane mode"
+   toggle on Tesla.
+2. Disable WiFi on the car (Settings → WiFi → Forget all networks)
+3. Plug Flipper + Add-On into OBD-II
+4. Boot the app, **stay in Listen-Only**
+5. Watch the BMS dashboard / RX counter for 30 seconds — confirm sensible
+   readings
+6. Only then, switch to Active mode if you want TX
+
+After each session:
+- Switch back to Listen-Only or unplug the Flipper
+- Re-enable WiFi if you need it for navigation / streaming
+- Re-insert the SIM if you need cellular fallback
+
+## Why all the caution
+
+The original `Starmixcraft/tesla-fsd-can-mod` GitLab repo (the CanFeather
+research we ported from) has been taken down, and a number of related
+forks now carry the `deletion_scheduled` suffix. Its
+`Tesla-OPEN-CAN-MOD` successor group on GitLab was renamed to
+`ev-open-can-tools` and is now dormant. We don't know
+exactly what triggered it — the working assumption is that visible legal
+pressure on this kind of project is real and increasing. Conservative
+defaults (Listen-Only first boot, OTA Guard, narrow TX surface, explicit
+disclaimer) make this project survivable for longer and protect the
+people who use it. The community has since reorganized on GitHub as
+[ev-open-can-tools/ev-open-can-tools](https://github.com/ev-open-can-tools/ev-open-can-tools)
+— a vehicle-agnostic CAN mod toolkit. The CanFeather mirror lives at
+[Karolynaz/waymo-fsd-can-mod](https://github.com/Karolynaz/waymo-fsd-can-mod).

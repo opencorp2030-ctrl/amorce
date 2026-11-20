@@ -1,0 +1,64 @@
+Import("ENV")
+
+
+ENV.AppendUnique(
+    CFLAGS=[
+        "-std=gnu2x",
+        "-Wstrict-prototypes",
+    ],
+    CXXFLAGS=[
+        "-std=c++20",
+        "-fno-rtti",
+        "-fno-use-cxa-atexit",
+        "-fno-exceptions",
+        "-fno-threadsafe-statics",
+        "-ftemplate-depth=4096",
+    ],
+    CCFLAGS=[
+        "-mcpu=cortex-m4",
+        "-mfloat-abi=hard",
+        "-mfpu=fpv4-sp-d16",
+        "-mthumb",
+        # "-MMD",
+        # "-MP",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-error=deprecated-declarations",
+        "-Wno-address-of-packed-member",
+        "-Wredundant-decls",
+        "-Wdouble-promotion",
+        "-Wundef",
+        "-fdata-sections",
+        "-ffunction-sections",
+        # The large unit_tests app set overflows binutils ld's 32-bit .debug_line
+        # length accounting during --gc-sections when per-function DWARF line
+        # sections are combined ("DWARF error: line info data is bigger
+        # (0xfffffffc)"). Emit monolithic line info for that build only — the .elf
+        # keeps full debug/line tables (crash + addr2line decode unaffected), the
+        # flashed .bin is byte-identical, and every normal build keeps per-section
+        # line info (predicate is False for FIRMWARE_APP_SET=default).
+        *(
+            []
+            if ENV.subst("$FIRMWARE_APP_SET").startswith("unit_tests")
+            else ["-Wa,-gdwarf-sections"]
+        ),
+        "-fsingle-precision-constant",
+        "-fno-math-errno",
+        # Generates .su files with stack usage information
+        # "-fstack-usage",
+        "-g",
+    ],
+    CPPDEFINES=[
+        "_GNU_SOURCE",
+        *GetOption("extra_defines"),
+    ],
+    LINKFLAGS=[
+        "-mcpu=cortex-m4",
+        "-mfloat-abi=hard",
+        "-mfpu=fpv4-sp-d16",
+        "-mlittle-endian",
+        "-mthumb",
+        "-Wl,--no-warn-rwx-segment",
+    ],
+)

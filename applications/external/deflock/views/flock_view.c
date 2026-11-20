@@ -1,0 +1,1120 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 ReconGrunt
+#include "flock_view.h"
+#include "../recon_app_i.h"
+#include "../helpers/gps_link.h"
+#include "ui_widgets.h"
+
+#include <gui/elements.h>
+
+#define ROW_H        11
+#define LIST_TOP     27
+#define VISIBLE_ROWS 3
+// Deauth/disassoc frames per ~1s interval needed to call it a flood. Normal
+// roaming/idle churn is 1-2/s; a real flood is many. Below this we don't alert
+// (avoids false positives on benign disassoc churn).
+
+struct FlockView {
+    View* view;
+    FlockViewOkCallback ok_cb;
+    void* ok_ctx;
+    FlockViewOkCallback hold_cb;
+    void* hold_ctx;
+};
+
+typedef struct {
+    void* app; /**< ReconApp* */
+    int selected; /**< DISPLAY position (index into order[]), not a table index */
+    int top;
+    /* Newest-first display order: order[display_pos] = index into app->flock[].
+     * The table itself stays in first-seen order because other code (the store,
+     * the locator, the detail scene) addresses it by index; only the view
+     * reorders. Rebuilt every draw -- 64 entries, once per tick, is free. */
+    int order[RECON_FLOCK_MAX];
+    int order_count;
+    /* The cursor is anchored to a DEVICE, not a row number. With newest-first
+     * ordering a new hit lands at the top and pushes every row down; without
+     * this the selection would slide under the operator's finger, and Left on
+     * this screen is Delete. Cleared by Up/Down so a deliberate move wins. */
+    uint8_t sel_mac[6];
+    bool sel_valid;
+    int card_index; /**< row the live card points at, or -1. Written by the draw
+                      *  pass, read by OK, so the jump lands on the device that
+                      *  actually beeped rather than re-deriving it. */
+} FlockViewModel;
+
+/**
+ * Newest-first comparison. seen_epoch is wall clock and is written on EVERY live
+ * sighting as well as carried by entries restored from hits.csv, so it is the one
+ * key that orders live and archived rows against each other correctly. last_tick
+ * only breaks ties inside a session (and is 0 for a restored entry).
+ */
+static bool flock_row_newer(const FlockEntry* a, const FlockEntry* b) {
+    if(a->seen_epoch != b->seen_epoch) return a->seen_epoch > b->seen_epoch;
+    return a->last_tick > b->last_tick;
+}
+
+/** Rebuild order[] newest-first. Caller holds app->mutex. */
+static void flock_view_build_order(ReconApp* app, FlockViewModel* model) {
+    int n = (int)app->flock_count;
+    if(n > RECON_FLOCK_MAX) n = RECON_FLOCK_MAX;
+    for(int i = 0; i < n; i++)
+        model->order[i] = i;
+    // Insertion sort: n <= 64 and it runs once per draw, so the simple algorithm
+    // is the right one. Anything cleverer here would be harder to read for no
+    // measurable gain.
+    for(int i = 1; i < n; i++) {
+        int v = model->order[i];
+        int j = i - 1;
+        while(j >= 0 && flock_row_newer(&app->flock[v], &app->flock[model->order[j]])) {
+            model->order[j + 1] = model->order[j];
+            j--;
+        }
+        model->order[j + 1] = v;
+    }
+    model->order_count = n;
+}
+
+/** How long the "what just beeped?" card stays up, in ticks (ms), when
+ *  Settings -> Card dismiss is Auto. Raised from 3000: three seconds was not
+ *  long enough to read the rung, the device and the name while driving. With
+ *  Card dismiss set to "Next hit" this is ignored and the card holds until the
+ *  next detection replaces it. */
+#define CARD_MS 6000u
+
+static char confidence_char(FlockConfidence c) {
+    switch(c) {
+    case FlockConfidenceConfirmed:
+        return '!';
+    case FlockConfidenceProbeFp:
+        return 'F'; // B1 IE-fingerprint class match
+    case FlockConfidenceLikely:
+        return 'L';
+    case FlockConfidencePossible:
+        return 'p';
+    default:
+        return '.';
+    }
+}
+
+// One visible list row, copied out of the shared table under the mutex so the
+// render pass can run entirely unlocked.
+typedef struct {
+    char conf_ch;
+    char ftype; /**< P/B/R/O/F/L -- 'L' is the BLE radio, everything else Wi-Fi */
+    uint8_t dev_class; /**< FlockDevClass -> short "ST "/"AX " tag on the row */
+    bool hidden; /**< beacons with no SSID -> "[hid]" instead of a blank name */
+    char ssid[RECON_SSID_LEN];
+    uint8_t mac[6];
+    int8_t rssi;
+    bool marked;
+    bool confirmed; /**< operator saw it -- shown as "+" so ground truth is visible
+                      *   on the row without opening anything */
+    char label[FLOCK_STORE_LABEL_LEN]; /**< operator's own name; wins over the SSID */
+    bool selected;
+    bool archived; /**< restored from hits.csv, not seen yet this session */
+    uint32_t seen_epoch; /**< RTC seconds of that stored sighting (archived only) */
+} FlockRowSnap;
+
+/**
+ * Compact age of a stored sighting: "5m", "3h", "2d", or "old" past 99 days.
+ * Shown in place of the signal bars for an archived row -- a saved RSSI is not
+ * a live reading, and drawing bars for it would claim the device is in range
+ * right now.
+ */
+static void flock_age_str(char* out, size_t out_len, uint32_t now_epoch, uint32_t seen_epoch) {
+    if(!seen_epoch || now_epoch < seen_epoch) {
+        snprintf(out, out_len, "--");
+        return;
+    }
+    uint32_t s = now_epoch - seen_epoch;
+    if(s < 3600u) {
+        snprintf(out, out_len, "%lum", (unsigned long)(s / 60u));
+    } else if(s < 86400u) {
+        snprintf(out, out_len, "%luh", (unsigned long)(s / 3600u));
+    } else if(s < 86400u * 100u) {
+        snprintf(out, out_len, "%lud", (unsigned long)(s / 86400u));
+    } else {
+        snprintf(out, out_len, "old");
+    }
+}
+
+static void flock_view_draw_callback(Canvas* canvas, void* _model) {
+    FlockViewModel* model = _model;
+    ReconApp* app = model->app;
+    if(!app) return;
+
+    canvas_clear(canvas);
+
+    // ---- snapshot live data under the mutex; do ALL snprintf/canvas AFTER ----
+    // Holding app->mutex across the whole canvas render stalls the ESP worker
+    // every frame; copy the scalars and the <=3 visible
+    // rows into locals (cheap, no canvas/snprintf), release, then draw. Same
+    // pattern as flock_map_view.c.
+    FlockRowSnap rows[VISIBLE_ROWS];
+    int nrows = 0;
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+
+    size_t count = app->flock_count;
+    bool connected = app->esp_connected;
+    bool lost = app->esp_lost;
+    uint32_t hits = app->esp_hits;
+    uint8_t channel = app->esp_channel;
+    uint32_t lines = app->esp_lines;
+    int32_t frame_rate = app->esp_frame_rate;
+    uint32_t ble_seen = app->esp_ble_seen;
+    uint32_t ble_scans = app->esp_ble_scans;
+    uint32_t alerts = app->alert_fired;
+    bool warn_dismissed = app->warn_dismissed;
+    uint32_t reboots = app->esp_reboots;
+    bool proto_mismatch = app->esp_proto_mismatch;
+    uint8_t proto_version = app->esp_proto_version;
+    // The SIGNATURE-TABLE verdict, which until now only the health screen
+    // showed. It is the one companion-staleness signal worth interrupting a
+    // scan for: it moves only when the detection data itself changed, so a
+    // board that trips it is gating frames on a table this app has already
+    // revised -- new ALPR prefixes it will never match, retracted ones it
+    // still will. Discussion #26 asked to be told when a reflash is actually
+    // needed, and this is that moment, as opposed to the version string
+    // moving on every release.
+    bool sig_mismatch = app->esp_sig_mismatch;
+    uint32_t dropped = app->esp_dropped_lines;
+    bool port_busy = (app->esp_link_state == EspLinkPortBusy);
+    bool generic = (app->settings.backend == EspBackendGeneric);
+    bool gps_enabled = app->settings.gps_enabled;
+    bool gps_valid = app->gps_valid;
+    int gps_sats = app->gps_sats;
+    // GPS is on but can never produce a fix. Two distinct causes, one badge:
+    //
+    //  1. GPS Port is set to the SAME UART as the ESP. scan_session_gps_start()
+    //     refuses that outright (it would steal the ESP's port) and returns
+    //     without allocating app->gps -- silently, until now. This is a pure
+    //     configuration test, which is why it reads settings and not link state.
+    //  2. The port is real but held by something else, so the acquire failed.
+    //     gps_link latches that separately.
+    //
+    // Either way the old UI showed a hollow "searching" badge forever. A user on
+    // issue #5 pointed GPS at pins 13/14 (the ESP's own USART), got no feedback
+    // at all, and reasonably concluded GPS was broken.
+    // Only the Flipper-UART source can hit either of these: the companion source
+    // has no second port to clash over or fail to acquire, so with it selected a
+    // missing fix genuinely is "searching" (or the companion isn't relaying).
+    bool gps_busy =
+        app->settings.gps_source == ReconGpsSourceFlipper &&
+        ((app->settings.gps_uart == app->settings.esp_uart) || gps_link_port_busy(app->gps));
+
+    // The companion path's equivalent, which until v0.54 did not exist: with the
+    // ESP32 selected as the GPS source, EVERY failure rendered as the hollow
+    // "searching" badge forever -- relay refused, firmware too old to have a
+    // relay, wrong pin, wrong baud, no sky view. Four distinct problems, one
+    // indistinguishable symptom, which is most of why issue #5's GPS report took
+    // four rounds to resolve.
+    //
+    // Two verdicts are now separable, and they need different fixes:
+    //   gps_relay_bad  -> the companion ANSWERED and said it is not relaying, so
+    //                     it refused the pin (it rejects 0/1/3 and >=48). Change
+    //                     the pin.
+    //   gps_relay_mute -> nothing came back at all. The firmware predates the
+    //                     relay, or is not the FlipDeFlock companion. Reflash.
+    // Everything else -- right pin, wrong baud, no antenna, indoors -- is a real
+    // "searching", and the badge deliberately keeps saying so rather than
+    // guessing at a cause it cannot observe.
+    bool gps_companion = app->settings.gps_enabled &&
+                         app->settings.gps_source == ReconGpsSourceCompanion;
+    // Selecting the companion as the GPS source while running Marauder asks for a
+    // relay from firmware that has no such command. Nothing will ever arrive.
+    bool gps_relay_bad = gps_companion && (generic || app->gps_relay == ReconGpsRelayOff);
+    // Only after the ack window, and only once the link is actually up: before
+    // that, silence means "still connecting", not "wrong firmware".
+    bool gps_relay_mute = gps_companion && !generic && connected &&
+                          app->gps_relay == ReconGpsRelayUnknown && app->gps_cfg_tick &&
+                          (furi_get_tick() - app->gps_cfg_tick) > furi_ms_to_ticks(4000);
+
+    // The phone (RPC) source's equivalent. It has strictly more ways to fail than
+    // either NMEA path -- the position comes from a separate device, over a link
+    // the app does not own, behind an OS permission -- and every one of them is
+    // fixable by the operator IF they are told which one it is. gps_rpc.c
+    // classifies; this only renders.
+    bool gps_phone = app->settings.gps_enabled && app->settings.gps_source == ReconGpsSourcePhone;
+    uint8_t phone = gps_phone ? app->gps_phone : (uint8_t)ReconGpsPhoneOff;
+
+    // One place decides both the badge and the explanation, so the two can never
+    // describe different faults.
+    const char* fault_title = NULL;
+    const char* fault_msg = NULL;
+    const char* fault_fix = NULL;
+    if(phone == ReconGpsPhoneUnsupported) {
+        fault_title = "!FW  no phone GPS";
+        fault_msg = "Needs Unleashed firmware.";
+        fault_fix = "Settings > GPS From";
+    } else if(phone == ReconGpsPhoneNoClient) {
+        fault_title = "!APP  not paired";
+        fault_msg = "No companion app linked.";
+        fault_fix = "Open qUnleashed, pair";
+    } else if(phone == ReconGpsPhoneNoPermission) {
+        fault_title = "!PERM  denied";
+        fault_msg = "Phone denied location.";
+        fault_fix = "Allow location on phone";
+    } else if(phone == ReconGpsPhoneDisabled) {
+        fault_title = "!LOC  turned off";
+        fault_msg = "Phone location is off.";
+        fault_fix = "Turn on phone location";
+    } else if(phone == ReconGpsPhoneNoFix) {
+        fault_title = "!LOC  no receiver";
+        fault_msg = "Paired device has no GPS.";
+        fault_fix = "Pair a phone, not a PC";
+    } else if(phone == ReconGpsPhoneCoarse) {
+        // Not "searching": the phone is answering, with a cell/Wi-Fi estimate too
+        // wide to place a camera with. Saying "searching" here would hide a fault
+        // that never resolves on its own.
+        fault_title = "!ACC  too coarse";
+        fault_msg = "Fix is over 100 m wide.";
+        fault_fix = "Move outside for sky view";
+    } else if(phone == ReconGpsPhoneError) {
+        fault_title = "!ERR  phone error";
+        fault_msg = "Companion reported a fault.";
+        fault_fix = "Reopen the companion app";
+    } else if(gps_relay_mute) {
+        fault_title = "!FW  no GPS relay";
+        fault_msg = "Companion never answered.";
+        fault_fix = "Reflash: ESP32 Firmware";
+    } else if(gps_relay_bad) {
+        fault_title = "!PIN  refused";
+        fault_msg = "Board rejected that pin.";
+        fault_fix = "Settings > ESP GPS Pin";
+    } else if(gps_busy) {
+        fault_title = "!PORT  UART clash";
+        fault_msg = "GPS and ESP share a port.";
+        fault_fix = "Settings > GPS Port";
+    }
+
+    app->gps_fault_active = (fault_msg != NULL);
+
+    // Auto-5V state, so the operator can see that the app is powering the board
+    // (it costs battery) or that it tried and could not (which is why nothing is
+    // happening). Read here under the lock with everything else.
+    bool otg_ours = app->otg_on_by_us;
+    bool otg_failed = app->otg_failed;
+
+    // "What just beeped?" card, filled at the end of this locked block.
+    bool card_active = false;
+    int card_index = -1;
+    char card_rung[16] = {0};
+    char card_what[32] = {0};
+    char card_who[40] = {0};
+
+    // Clamp selection/scroll (touches only the view model) then copy the visible
+    // rows, so the render loop below needs no lock.
+    flock_view_build_order(app, model);
+    if(count > 0) {
+        // Re-find the anchored device in the new order. If it is gone (deleted,
+        // or evicted from a full table) fall back to the old position so the
+        // cursor stays roughly where the operator left it.
+        int sel = -1;
+        if(model->sel_valid) {
+            for(int i = 0; i < model->order_count; i++) {
+                if(memcmp(app->flock[model->order[i]].mac, model->sel_mac, 6) == 0) {
+                    sel = i;
+                    break;
+                }
+            }
+        }
+        if(sel < 0) sel = model->selected;
+        if(sel >= model->order_count) sel = model->order_count - 1;
+        if(sel < 0) sel = 0;
+        model->selected = sel;
+        // Re-anchor to whatever is under the cursor now, so the next frame
+        // tracks this device even if newer hits arrive above it.
+        memcpy(model->sel_mac, app->flock[model->order[model->selected]].mac, 6);
+        model->sel_valid = true;
+
+        if(model->selected < model->top) model->top = model->selected;
+        if(model->selected >= model->top + VISIBLE_ROWS)
+            model->top = model->selected - VISIBLE_ROWS + 1;
+        if(model->top < 0) model->top = 0;
+
+        for(int row = 0; row < VISIBLE_ROWS; row++) {
+            int pos = model->top + row;
+            if(pos >= model->order_count) break;
+            int idx = model->order[pos];
+            FlockEntry* e = &app->flock[idx];
+            FlockRowSnap* r = &rows[nrows++];
+            r->conf_ch = confidence_char(e->confidence);
+            r->ftype = e->ftype;
+            r->dev_class = e->dev_class;
+            r->hidden = e->hidden;
+            strncpy(r->ssid, e->ssid, RECON_SSID_LEN - 1);
+            r->ssid[RECON_SSID_LEN - 1] = '\0';
+            memcpy(r->mac, e->mac, 6);
+            r->rssi = e->rssi;
+            r->marked = e->marked;
+            r->confirmed = e->confirmed;
+            snprintf(r->label, sizeof(r->label), "%s", e->label);
+            r->selected = (pos == model->selected);
+            r->archived = e->archived;
+            r->seen_epoch = e->seen_epoch;
+        }
+    }
+
+    // ---- "what just beeped?" card (discussion #7) -----------------------
+    // Composed here, under the lock we already hold, into fixed buffers -- the
+    // render pass below runs entirely unlocked, exactly like the row snapshots.
+    // CARD_MS is short on purpose: this is an answer to a sound that just
+    // played, not a dialog, and anything that lingers becomes something to swat
+    // away on every hit.
+    // Auto: the card ages out after CARD_MS. "Next hit": it holds until another
+    // detection overwrites alert_card_tick, so a hit found while you were
+    // watching the road is still on screen when you look down. Either way any
+    // key press dismisses it (see the input handler).
+    bool card_unexpired = app->settings.card_autodismiss ?
+                              ((uint32_t)(furi_get_tick() - app->alert_card_tick) < CARD_MS) :
+                              true;
+    if(app->alert_card_tick && card_unexpired) {
+        for(size_t i = 0; i < app->flock_count; i++) {
+            if(memcmp(app->flock[i].mac, app->alert_card_mac, 6) != 0) continue;
+            FlockEntry* e = &app->flock[i];
+            card_active = true;
+            card_index = (int)i;
+            snprintf(card_rung, sizeof(card_rung), "%s", flock_confidence_str(e->confidence));
+            // Vendor-aware, so the card cannot announce an Axon or Ubicquia
+            // unit as a Flock camera -- the same rule as the detail screen.
+            FlockVendor ven = flock_vendor_of(e->mac, e->ssid);
+            snprintf(
+                card_what,
+                sizeof(card_what),
+                "%s",
+                flock_device_long_str(ven, (FlockDevClass)e->dev_class));
+            // The name if it has one, else whatever identifies it best.
+            if(e->ssid[0]) {
+                snprintf(card_who, sizeof(card_who), "%s", e->ssid);
+            } else if(ven != FlockVendorUnknown) {
+                snprintf(
+                    card_who,
+                    sizeof(card_who),
+                    "%s %02X:%02X:%02X",
+                    flock_vendor_str(ven),
+                    e->mac[3],
+                    e->mac[4],
+                    e->mac[5]);
+            } else {
+                snprintf(
+                    card_who,
+                    sizeof(card_who),
+                    "%02X:%02X:%02X:%02X:%02X:%02X",
+                    e->mac[0],
+                    e->mac[1],
+                    e->mac[2],
+                    e->mac[3],
+                    e->mac[4],
+                    e->mac[5]);
+            }
+            break;
+        }
+        // Fell through without a match: the device was evicted from the table
+        // between the beep and this frame. Drop the card rather than draw a
+        // stale one -- there is nothing for OK to open.
+        if(!card_active) app->alert_card_tick = 0;
+    }
+
+    furi_mutex_release(app->mutex);
+
+    // Wall clock for the archived rows' age column. Read outside the lock (it is
+    // an RTC register read, not shared app state).
+    uint32_t now_epoch = furi_hal_rtc_get_timestamp();
+
+    // ---- render from the snapshot (no mutex held) --------------------------
+    // Header / status bar. Compact
+    // right-aligned status for the inverted title bar.
+    //
+    // EVERY COUNTER APPEARS EXACTLY ONCE across the two header lines (issue #5):
+    // channel and hits live up here, frames/rx on the sub-line. They used to be
+    // printed in both places, which cost the sub-line the width it needed and
+    // pushed the row text into an overrun. "FLOCK/ALPR" loses its spaces for the
+    // same two characters.
+    //
+    // Channel is space-padded to a fixed 3 (1-14 / 36-165 / 6 GHz up to 233 on a
+    // C5) so the right-aligned block stops jittering as the sweep hops.
+    char right[16]; // fits "ch165 h999999" + NUL; snprintf truncates safely beyond
+    if(generic) {
+        snprintf(right, sizeof(right), "rx%lu", (unsigned long)lines);
+    } else {
+        snprintf(right, sizeof(right), "ch%3u h%lu", channel, (unsigned long)hits);
+    }
+    ui_title_bar_icon(canvas, UiIconCamera, "FDF", right); // leaves color=black, font=Secondary
+
+    // Status sub-line: only what the title bar does NOT already show.
+    // A wire-protocol version mismatch is the highest-priority health warning (the
+    // data may be mis-parsed). A non-zero dropped-line count
+    // (overlong RX lines) is appended as a "!dN" health suffix on the normal lines.
+    char drop[16] = "";
+    if(dropped) snprintf(drop, sizeof(drop), " !d%lu", (unsigned long)dropped);
+    char hdr[64]; // the non-icon variants (proto mismatch / Marauder)
+    // The normal companion line is drawn as SEGMENTS, not one string, because two
+    // of its fields are glyphs. Reusing the row icons rather than the letters
+    // "rx" and "b" was a user's suggestion and it is strictly better: the same
+    // mark already means Wi-Fi and BLE on every row below, so the header stops
+    // needing its own vocabulary. Their mock-up put the icons BESIDE the labels,
+    // which is wider than what it replaced -- these replace them.
+    bool icon_line = false;
+    char rate_s[10] = "";
+    char ble_s[10] = "";
+    char tail_s[40] = ""; // a<n> + optional !r<n> + optional !d<n>
+    if(proto_mismatch) {
+        snprintf(hdr, sizeof(hdr), "! Companion FW proto v%u mismatch", proto_version);
+    } else if(sig_mismatch) {
+        // NAMES THE FIX, like every other fault string on this screen. "sig
+        // mismatch" is what the health screen says and it is fine there, next
+        // to both revisions; here there is no room for the evidence, so the
+        // line has to carry the action instead.
+        snprintf(hdr, sizeof(hdr), "! Companion sigs old: reflash");
+    } else if(generic) {
+        // Companion status counters stay 0 on a Marauder board, so the title bar
+        // carries the RX heartbeat there and the detection count belongs here.
+        snprintf(
+            hdr,
+            sizeof(hdr),
+            "%s  hits %zu%s",
+            connected ? "ESP" :
+            lost      ? "ESP?" :
+                        "...",
+            count,
+            drop);
+    } else {
+        // Live activity, not a lifetime total. "frames 319" only ever climbed, so
+        // it told you the link was up and nothing about whether the radio was
+        // hearing anything RIGHT NOW -- the actual question while parked next to a
+        // camera that is not showing up (issue #5).
+        //
+        //   rx<n>/s  Wi-Fi frames per second. "--" until two status lines land.
+        //   b<n>     BLE adverts this session. The Flock screen showed NOTHING
+        //            about BLE, so a working BLE half and one that never ran were
+        //            indistinguishable -- and BLE is the easy detection on these.
+        //   !r<n>    the companion RESTARTED n times. A lifetime counter can only
+        //            fall if the board rebooted; that used to be absorbed silently
+        //            and just looked like the number sliding back to zero.
+        // Clamped, not just formatted: the compiler cannot prove a uint32_t fits
+        // these buffers, and a header field that can grow without bound is a bug
+        // waiting for a long drive.
+        // Spaces dropped after each tag on a user's suggestion: the sub-line has
+        // to clear the GPS badge, and "b" is unambiguous next to a digit.
+        //
+        //   rx<n>/s  Wi-Fi frames per second, "--" until two status lines land.
+        //   b<n>     BLE adverts. "b-" means NO BLE scan phase has completed yet,
+        //            which a bare 0 could not distinguish from "BLE ran and heard
+        //            nothing" -- and that ambiguity is exactly what left a user
+        //            unable to tell whether his BLE half worked at all.
+        //   a<n>     alerts DELIVERED. The app firing and the Flipper's own
+        //            notification settings swallowing it are different faults with
+        //            different fixes, and "no beep" was reported three times with
+        //            no way to see which one it was.
+        //   !r<n>    the companion restarted.
+        char rst[10] = "";
+        if(reboots) snprintf(rst, sizeof(rst), " !r%u", (unsigned)(reboots > 99 ? 99 : reboots));
+        if(frame_rate < 0) {
+            snprintf(rate_s, sizeof(rate_s), "--/s");
+        } else {
+            snprintf(
+                rate_s, sizeof(rate_s), "%u/s", (unsigned)(frame_rate > 9999 ? 9999 : frame_rate));
+        }
+        if(!ble_scans) {
+            snprintf(ble_s, sizeof(ble_s), "-");
+        } else {
+            snprintf(ble_s, sizeof(ble_s), "%u", (unsigned)(ble_seen > 9999 ? 9999 : ble_seen));
+        }
+        snprintf(
+            tail_s, sizeof(tail_s), "a%u%s%s", (unsigned)(alerts > 99 ? 99 : alerts), rst, drop);
+        icon_line = true;
+    }
+    canvas_set_font(canvas, FontSecondary);
+
+    // GPS state as a badge, not a code (issue #5). Four states, each visually
+    // distinct so it reads at a glance in a moving car:
+    //   filled "GPS n"  -- locked, n satellites (a fresh 2D fix vs a solid one)
+    //   hollow "GPS"    -- enabled, searching
+    //   filled "GPS!"   -- enabled but it can NEVER get a fix; go fix the config
+    //   filled "GPS?"   -- companion source, but the board never answered the
+    //                      relay config: wrong/old firmware, so reflash it
+    // The last two used to render as the hollow "searching" badge forever, which
+    // is indistinguishable from a cold start.
+    // Built BEFORE the sub-line is drawn, because its width is what the sub-line
+    // has to stop short of. A user counted the remaining gap by hand off a photo
+    // to work out whether another field would fit; the code should be the one
+    // measuring that, not him.
+    char gps_str[12] = "";
+    int gps_w = 0;
+    if(gps_enabled) {
+        // A FAULT BADGE MUST NOT START WITH THE WORD "GPS".
+        //
+        // "GPS!" and "GPS?" were both read as the GPS being on and working -- the
+        // reporter of the original GPS bug looked at a filled "GPS!" and said his
+        // board was "showing a gps lock". That is the exact opposite of what it
+        // meant, and it is not his misreading: a filled badge is how this header
+        // says "locked, n satellites", so a filled badge whose first three
+        // characters are G-P-S reads as a lock at a glance. The punctuation was
+        // carrying the entire meaning and lost.
+        //
+        // Each fault now NAMES THE THING TO FIX, and none of them says "GPS":
+        //   !PORT  the Flipper's GPS and ESP are on the same UART, or the port is
+        //          held -- change GPS Port
+        //   !PIN   the companion answered and refused that pin -- change ESP GPS Pin
+        //   !FW    the companion never answered at all -- reflash it
+        // The leading "!" is this app's existing warning mark (!r, !d).
+        //   !APP   the phone source is selected but nothing is paired
+        //   !PERM  the phone denied location permission
+        //   !LOC   the phone's location is off, or it has no receiver at all
+        //   !ACC   the phone is answering, but too coarsely to place a camera
+        //   !ERR   the companion app reported a fault it did not classify
+        if(phone == ReconGpsPhoneUnsupported) {
+            snprintf(gps_str, sizeof(gps_str), "!FW");
+        } else if(phone == ReconGpsPhoneNoClient) {
+            snprintf(gps_str, sizeof(gps_str), "!APP");
+        } else if(phone == ReconGpsPhoneNoPermission) {
+            snprintf(gps_str, sizeof(gps_str), "!PERM");
+        } else if(phone == ReconGpsPhoneDisabled || phone == ReconGpsPhoneNoFix) {
+            snprintf(gps_str, sizeof(gps_str), "!LOC");
+        } else if(phone == ReconGpsPhoneCoarse) {
+            snprintf(gps_str, sizeof(gps_str), "!ACC");
+        } else if(phone == ReconGpsPhoneError) {
+            snprintf(gps_str, sizeof(gps_str), "!ERR");
+        } else if(gps_relay_mute) {
+            snprintf(gps_str, sizeof(gps_str), "!FW");
+        } else if(gps_relay_bad) {
+            snprintf(gps_str, sizeof(gps_str), "!PIN");
+        } else if(gps_busy) {
+            snprintf(gps_str, sizeof(gps_str), "!PORT");
+        } else if(gps_valid && gps_sats > 0) {
+            // Clamped to two digits: the badge is laid out against a fixed width
+            // that the sub-line measures itself against, so an out-of-range count
+            // would push it off the right edge rather than just looking wrong.
+            // Both sources already bound this (NMEA at 64, RPC at 64), which is
+            // exactly why capping here costs nothing real.
+            snprintf(gps_str, sizeof(gps_str), "GPS %d", gps_sats > 99 ? 99 : gps_sats);
+        } else {
+            // Either searching or locked-without-a-satellite-count; the FILL,
+            // decided below from gps_valid, is what separates them, so the text is
+            // the same either way.
+            //
+            // The count is printed only when it is real. A phone's fused location
+            // provider does not expose one (nor does an RMC-only receiver that
+            // never sends GGA), and the field is initialised to 0 -- so printing
+            // it unconditionally rendered a filled "GPS 0", which reads as a lock
+            // on zero satellites. That is a contradiction the operator has to stop
+            // and resolve mid-drive, from a badge whose whole job is to be read at
+            // a glance.
+            snprintf(gps_str, sizeof(gps_str), "GPS");
+        }
+        gps_w = canvas_string_width(canvas, gps_str) + 4;
+    }
+    int sub_limit = gps_enabled ? (128 - gps_w - 3) : 126;
+
+    if(icon_line) {
+        // Wi-Fi glyph + rate, BLE glyph + count, then the plain-text tail. Each
+        // segment is placed from the measured width of the one before it, and
+        // nothing is drawn past sub_limit, so the line can never grow into the
+        // GPS badge however large the counters get.
+        int sx = 0;
+        // "ESP?" is a board that WAS talking and stopped (see
+        // recon_app_liveness_tick); "..." is one that never has. Different
+        // faults: the first is a loose header or a brownout, the second a port
+        // or power setting.
+        const char* conn = connected ? "ESP" : lost ? "ESP?" : "...";
+        canvas_draw_str(canvas, sx, 22, conn);
+        sx += canvas_string_width(canvas, conn) + 3;
+        if(sx + UI_RADIO_ICON_W < sub_limit) {
+            ui_icon_radio(canvas, sx, 16, false);
+            sx += UI_RADIO_ICON_W;
+            ui_draw_str_fit(canvas, sx, 22, rate_s, sub_limit);
+            sx += canvas_string_width(canvas, rate_s) + 4;
+        }
+        if(sx + UI_RADIO_ICON_W < sub_limit) {
+            ui_icon_radio(canvas, sx, 16, true);
+            sx += UI_RADIO_ICON_W;
+            ui_draw_str_fit(canvas, sx, 22, ble_s, sub_limit);
+            sx += canvas_string_width(canvas, ble_s) + 4;
+        }
+        if(sx < sub_limit) ui_draw_str_fit(canvas, sx, 22, tail_s, sub_limit);
+    } else {
+        ui_draw_str_fit(canvas, 0, 22, hdr, sub_limit);
+    }
+
+    if(gps_enabled) {
+        int w = gps_w;
+        int x = 128 - w;
+        // Fill for both "locked" and "misconfigured": a filled badge means "this
+        // is settled, stop waiting for it" either way, and the glyph says which.
+        //
+        // Every phone-source state except Waiting is settled in that sense --
+        // including Coarse, where fixes ARE arriving and none of them will ever be
+        // good enough. Leaving that one hollow would say "still searching" about a
+        // condition that resolves only if the operator walks outside.
+        bool phone_fault = (phone != ReconGpsPhoneOff) && (phone != ReconGpsPhoneWaiting) &&
+                           (phone != ReconGpsPhoneStreaming);
+        if(gps_valid || gps_busy || gps_relay_bad || gps_relay_mute || phone_fault) {
+            canvas_draw_box(canvas, x, 14, w, 10);
+            canvas_set_color(canvas, ColorWhite);
+        } else {
+            canvas_draw_frame(canvas, x, 14, w, 10);
+        }
+        canvas_draw_str(canvas, x + 2, 22, gps_str);
+        canvas_set_color(canvas, ColorBlack);
+    }
+    canvas_draw_line(canvas, 0, 24, 128, 24);
+
+    // A fault explains itself HERE, where you meet it, once per session.
+    //
+    // The badge names what is wrong in five characters, which is all the header
+    // has room for and is useless on its own: a user hit !PORT and said "I don't
+    // know what it means and have no way of finding out." Naming a fault without
+    // saying what to do about it just relocates the confusion, so the card
+    // carries the fix line itself. It used to end "see Help" instead -- a pointer
+    // to a screen that no longer exists, which is worse than no pointer: the
+    // reference now lives in docs/TROUBLESHOOTING.md, which costs no RAM.
+    // Dismissed with OK, and only re-armed on a fresh scan session, so it never
+    // becomes something to swat away every frame.
+    if(fault_msg && !warn_dismissed) {
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, 0, 26, 128, 38);
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_frame(canvas, 0, 26, 128, 38);
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 3, 36, fault_title);
+        canvas_set_font(canvas, FontSecondary);
+        ui_draw_str_fit(canvas, 3, 45, fault_msg, 125);
+        ui_draw_str_fit(canvas, 3, 53, fault_fix, 125);
+        canvas_draw_str(canvas, 3, 62, "OK dismiss");
+        canvas_draw_line(canvas, 0, 24, 128, 24);
+        return;
+    }
+
+    // ---- "what just beeped?" card (discussion #7) -----------------------
+    // Drawn AFTER the fault panel returns above, so a GPS fault still wins the
+    // screen -- a card explaining a detection is not worth burying a message
+    // that says the scan itself is misconfigured.
+    //
+    // Deliberately a timed overlay and NOT a change to list ordering, which was
+    // the other option on the table. Sorting newest-first would move rows under
+    // a cursor whose selection is an INDEX, and Left on this screen is Delete:
+    // a row arriving while the operator reaches for it would silently retarget
+    // the delete at a different camera. The card answers the same question with
+    // no such hazard, and OK below jumps to the device so nothing is scrolled
+    // for anyway.
+    model->card_index = card_active ? card_index : -1;
+    if(card_active) {
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, 0, 26, 128, 38);
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_frame(canvas, 0, 26, 128, 38);
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 3, 36, card_rung);
+        canvas_set_font(canvas, FontSecondary);
+        ui_draw_str_fit(canvas, 3, 45, card_what, 125);
+        ui_draw_str_fit(canvas, 3, 53, card_who, 125);
+        canvas_draw_str(canvas, 3, 62, "OK opens - any key hides");
+        canvas_draw_line(canvas, 0, 24, 128, 24);
+        return;
+    }
+
+    if(count == 0) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(
+            canvas,
+            64,
+            44,
+            AlignCenter,
+            AlignCenter,
+            connected  ? "Scanning for ALPR..." :
+            lost       ? "ESP went silent - check" :
+            port_busy  ? "UART busy - check port" :
+            otg_failed ? "5V refused - use USB" :
+            otg_ours   ? "5V on, waiting for ESP" :
+                         "Connect ESP32...");
+        return;
+    }
+
+    for(int row = 0; row < nrows; row++) {
+        FlockRowSnap* r = &rows[row];
+        int y = LIST_TOP + row * ROW_H;
+        if(r->selected) {
+            canvas_set_color(canvas, ColorBlack);
+            canvas_draw_box(canvas, 0, y - 1, 128, ROW_H);
+            canvas_set_color(canvas, ColorWhite);
+        } else {
+            canvas_set_color(canvas, ColorBlack);
+        }
+
+        canvas_set_font(canvas, FontSecondary);
+
+        // ---- right edge first: it decides how much width the name gets -------
+        // RSSI as signal bars, on EVERY live row including the selected one. It
+        // used to switch to raw "-82dB" text when selected, because the bars
+        // helper forced ColorBlack and vanished on the inverted row; that made one
+        // list show two notations for the same column (issue #5). ui_signal_bars
+        // now inherits the row color, so the notation is uniform and the exact dBm
+        // lives on the detail screen.
+        //
+        // An ARCHIVED row shows the age of the stored sighting instead. Its RSSI
+        // was recorded on some earlier run, so bars (or a live-looking "-67dB")
+        // would assert the device is in range right now -- exactly the kind of
+        // over-claim the detections-are-indicators rule exists to prevent.
+        int text_max_x;
+        if(r->archived) {
+            char meta[18];
+            char age[8];
+            flock_age_str(age, sizeof(age), now_epoch, r->seen_epoch);
+            // "+" = the operator went and looked at this one. It is the only
+            // fact on the row that is not an inference, so it earns a mark of
+            // its own rather than being folded into "*".
+            snprintf(
+                meta, sizeof(meta), "%s%s%s", r->confirmed ? "+" : "", r->marked ? "*" : "", age);
+            canvas_draw_str_aligned(canvas, 126, y + 8, AlignRight, AlignBottom, meta);
+            text_max_x = 126 - canvas_string_width(canvas, meta) - 3;
+        } else {
+            if(r->marked) {
+                // marked indicator just left of the bars
+                canvas_draw_str(canvas, 96, y + 8, "*");
+            }
+            if(r->confirmed) {
+                // Left of the mark again, so a row can carry both without them
+                // overlapping or either one moving depending on the other.
+                canvas_draw_str(canvas, 89, y + 8, "+");
+            }
+            ui_signal_bars(canvas, 104, y - 1, r->rssi); // cell ~104..114, baseline y+7
+            text_max_x = r->confirmed ? 87 : (r->marked ? 94 : 102);
+        }
+
+        // ---- left: confidence rung, radio glyph, then the name ---------------
+        // The rung and the glyph are drawn as fixed cells rather than being
+        // sprintf'd into the string, because one of them is not text. Which radio
+        // saw a device is otherwise unknowable from the row (issue #5): an OUI and
+        // an RSSI look identical either way, and "has an SSID" is not the tell --
+        // hidden APs and probe requests have no name and still came in on Wi-Fi.
+        char cbuf[2] = {r->conf_ch, '\0'};
+        canvas_draw_str(canvas, 2, y + 8, cbuf);
+        ui_icon_radio(canvas, 8, y + 1, r->ftype == 'L');
+
+        // "ST:" acoustic sensor, "AX:" body-worn police camera, "VG:" vendor
+        // gear of unknown kind, "DR:" unmanned aircraft. Untagged rows are ALPR
+        // cameras -- the common case
+        // stays as terse as it was, and the list never silently presents a
+        // gunshot sensor or a body camera as a camera on a pole. Three chars each
+        // so the tagged and untagged rows still line up.
+        // Colon, not a space, after each tag. With a space "VG PLaybaLL" was read
+        // off a real drive as a device NAMED "VG Play Ball" -- the tag ran into the
+        // SSID. Still three characters, so tagged and untagged rows keep lining up.
+        const char* cls = "";
+        if(r->dev_class == FlockClassAcoustic)
+            cls = "ST:";
+        else if(r->dev_class == FlockClassBodycam)
+            cls = "AX:";
+        else if(r->dev_class == FlockClassGear)
+            // Vendor-exclusive competitor kit, make unknown. Untagged would mean
+            // "ALPR camera" by the rule above, and these prefixes carry hand-held
+            // radios and building cameras as well as plate readers -- the same
+            // reason ST and AX exist. Spelled out in Help under ROW MARKS.
+            cls = "VG:";
+        else if(r->dev_class == FlockClassDrone)
+            // An aircraft. This was MISSING when the drone class landed, so every
+            // Remote ID detection rendered untagged -- which by the rule above
+            // means "ALPR camera", i.e. the list announced a passing drone as a
+            // camera on a pole. Exactly the over-claim ST/AX/VG exist to prevent.
+            cls = "DR:";
+
+        char line[48];
+        if(r->label[0] != '\0') {
+            // The operator's own name wins. They set it precisely because the
+            // observed name was not what they wanted to read here; the SSID is
+            // still on the detail screen and in every report.
+            snprintf(line, sizeof(line), "%s%s", cls, r->label);
+        } else if(r->ssid[0] != '\0') {
+            // ">" means "this device is LOOKING FOR that network", which is what a
+            // probe request's SSID actually is. Without it, a phone hunting its
+            // home wifi reads as an ALPR camera named after someone's router --
+            // exactly how a real drive's list got misread. A camera probes with no
+            // name at all, so a ">" row is evidence against it being one.
+            snprintf(line, sizeof(line), "%s%s%s", cls, r->ftype == 'P' ? ">" : "", r->ssid);
+        } else if(r->hidden) {
+            // We watched this one beacon without a name. Worth surfacing, but it
+            // is an observation only -- the conf char is unchanged by it. Drops
+            // the MAC to its last 3 bytes to make room for the tag.
+            snprintf(
+                line, sizeof(line), "%s[hid] %02X:%02X:%02X", cls, r->mac[3], r->mac[4], r->mac[5]);
+        } else {
+            // NO SSID. This row used to be a bare 17-character MAC, which is the
+            // least readable thing on the screen and says nothing an operator can
+            // act on -- reported directly by the maintainer: "the first option
+            // that came up is a MAC address and I don't know what it means."
+            //
+            // We now know the vendor for most of these (that is what the OUI
+            // matched in the first place), so lead with it and keep only the last
+            // three bytes to tell two units of the same make apart. "Flock
+            // 00:00:02" answers the question the row is actually being read for;
+            // "B4:1E:52:00:00:02" makes the operator do the lookup themselves.
+            //
+            // Falls back to the full MAC when no vendor table matched, because
+            // then the hex genuinely IS everything we know -- printing a friendly
+            // label there would be inventing one.
+            FlockVendor ven = flock_vendor_of(r->mac, r->ssid);
+            if(ven != FlockVendorUnknown) {
+                snprintf(
+                    line,
+                    sizeof(line),
+                    "%s%s %02X:%02X:%02X",
+                    cls,
+                    flock_vendor_str(ven),
+                    r->mac[3],
+                    r->mac[4],
+                    r->mac[5]);
+            } else {
+                snprintf(
+                    line,
+                    sizeof(line),
+                    "%s%02X:%02X:%02X:%02X:%02X:%02X",
+                    cls,
+                    r->mac[0],
+                    r->mac[1],
+                    r->mac[2],
+                    r->mac[3],
+                    r->mac[4],
+                    r->mac[5]);
+            }
+        }
+        // Measured trim, not a hoped-for fit: the glyph cost the name ~7 px, and a
+        // full 32-char SSID never fitted in the first place. Both used to be drawn
+        // straight through the bars and off the right edge.
+        ui_draw_str_fit(canvas, 17, y + 8, line, text_max_x);
+    }
+    canvas_set_color(canvas, ColorBlack);
+}
+
+static bool flock_view_input_callback(InputEvent* event, void* context) {
+    FlockView* fv = context;
+    bool handled = false;
+
+    // A HOLD is its own gesture and MUST be handled before the block below.
+    // That block gates on `InputTypeShort || InputTypeRepeat`, so a branch
+    // nested inside it that tests for InputTypeLong can never match -- which is
+    // exactly where this lived in v0.83, making every action behind the hold
+    // (mark confirmed, rename, delete) unreachable on a real device while the
+    // code read as though it worked. Kept at the top level so the compiler
+    // cannot quietly strand it again.
+    //
+    // Deliberate actions live behind a hold so the fast keys stay fast: tap-OK
+    // opens the detail screen and Left deletes, both used while driving. Maps
+    // the display position back to a table index exactly as the short press does.
+    if(event->key == InputKeyOk && event->type == InputTypeLong) {
+        int hold_idx = -1;
+        int card_idx = -1;
+        ReconApp* app = NULL;
+        with_view_model(
+            fv->view,
+            FlockViewModel * model,
+            {
+                app = model->app;
+                card_idx = model->card_index;
+                if(model->selected >= 0 && model->selected < model->order_count) {
+                    hold_idx = model->order[model->selected];
+                }
+            },
+            false);
+        // WHILE THE HIT CARD IS UP, THE HOLD MEANS THE DEVICE ON THE CARD.
+        //
+        // The card covers the list, so the highlighted row is invisible, and the
+        // natural reaction to your own phone beeping is to hold OK and pick
+        // "It's mine: never alert". That used to act on whatever row happened to
+        // be highlighted UNDERNEATH -- permanently excluding a device the
+        // operator never saw, which could be the one real camera on the list.
+        // card_index is already a table index, which is what hold_cb takes.
+        if(app && card_idx >= 0) {
+            furi_mutex_acquire(app->mutex, FuriWaitForever);
+            bool live = app->alert_card_tick != 0;
+            if(live) app->alert_card_tick = 0; // the hold dismisses it, like any key
+            bool valid = card_idx < (int)app->flock_count;
+            furi_mutex_release(app->mutex);
+            if(live) {
+                with_view_model(
+                    fv->view, FlockViewModel * model, { model->card_index = -1; }, true);
+                if(valid) hold_idx = card_idx;
+            }
+        }
+        if(hold_idx >= 0 && fv->hold_cb) fv->hold_cb(fv->hold_ctx, hold_idx);
+        return true;
+    }
+
+    if(event->type == InputTypeShort || event->type == InputTypeRepeat) {
+        // The card owns the FIRST press while it is up. OK jumps to the device
+        // that beeped and opens it -- which is the whole point, since the row
+        // it lands on is the one that would otherwise have to be found by
+        // scrolling. Any other key just hides the card and is NOT swallowed
+        // beyond that, so a press meant for the list costs at most one tap.
+        {
+            ReconApp* app = NULL;
+            int card_idx = -1;
+            with_view_model(
+                fv->view,
+                FlockViewModel * model,
+                {
+                    app = model->app;
+                    card_idx = model->card_index;
+                },
+                false);
+            if(app && card_idx >= 0) {
+                furi_mutex_acquire(app->mutex, FuriWaitForever);
+                bool live = app->alert_card_tick != 0;
+                app->alert_card_tick = 0; // dismissed either way
+                furi_mutex_release(app->mutex);
+                if(live) {
+                    with_view_model(
+                        fv->view, FlockViewModel * model, { model->card_index = -1; }, true);
+                    if(event->key == InputKeyOk) {
+                        // card_index is a TABLE index. Anchor the cursor by that
+                        // device's MAC and let the next draw place it, rather
+                        // than writing a table index into a display position.
+                        with_view_model(
+                            fv->view,
+                            FlockViewModel * model,
+                            {
+                                ReconApp* a2 = model->app;
+                                if(a2) {
+                                    furi_mutex_acquire(a2->mutex, FuriWaitForever);
+                                    if(card_idx < (int)a2->flock_count) {
+                                        memcpy(model->sel_mac, a2->flock[card_idx].mac, 6);
+                                        model->sel_valid = true;
+                                    }
+                                    furi_mutex_release(a2->mutex);
+                                }
+                            },
+                            true);
+                        if(fv->ok_cb) fv->ok_cb(fv->ok_ctx, card_idx);
+                    }
+                    return true;
+                }
+            }
+        }
+        if(event->key == InputKeyUp) {
+            with_view_model(
+                fv->view,
+                FlockViewModel * model,
+                {
+                    if(model->selected > 0) model->selected--;
+                    // A deliberate move re-anchors to whatever is now under the
+                    // cursor; the next draw writes sel_mac from this position.
+                    model->sel_valid = false;
+                },
+                true);
+            handled = true;
+        } else if(event->key == InputKeyDown) {
+            with_view_model(
+                fv->view,
+                FlockViewModel * model,
+                {
+                    // Bound by the DISPLAY list, which is what the operator sees.
+                    // order_count is rebuilt every draw from flock_count, so it
+                    // needs no lock of its own here.
+                    if(model->selected < model->order_count - 1) model->selected++;
+                    model->sel_valid = false;
+                },
+                true);
+            handled = true;
+        } else if(event->key == InputKeyOk && event->type == InputTypeShort) {
+            // The fault panel owns OK while it is up: the first press is far more
+            // likely to be "I have read this" than "open a detail screen I cannot
+            // even see right now".
+            ReconApp* app = NULL;
+            with_view_model(fv->view, FlockViewModel * model, { app = model->app; }, false);
+            if(app) {
+                furi_mutex_acquire(app->mutex, FuriWaitForever);
+                bool showing = !app->warn_dismissed && app->gps_fault_active;
+                if(showing) app->warn_dismissed = true;
+                furi_mutex_release(app->mutex);
+                if(showing) return true;
+            }
+            // ok_cb takes a TABLE index, and model->selected is a display
+            // position, so map it through order[]. Passing the display position
+            // straight through would open the detail screen for a different
+            // camera than the highlighted one.
+            int table_idx = -1;
+            with_view_model(
+                fv->view,
+                FlockViewModel * model,
+                {
+                    if(model->selected >= 0 && model->selected < model->order_count) {
+                        table_idx = model->order[model->selected];
+                    }
+                },
+                false);
+            if(table_idx >= 0 && fv->ok_cb) fv->ok_cb(fv->ok_ctx, table_idx);
+            handled = true;
+        }
+    }
+    return handled;
+}
+
+FlockView* flock_view_alloc(void) {
+    FlockView* fv = malloc(sizeof(FlockView));
+    fv->ok_cb = NULL;
+    fv->hold_cb = NULL;
+    fv->hold_ctx = NULL;
+    fv->ok_ctx = NULL;
+    fv->view = view_alloc();
+    view_set_context(fv->view, fv);
+    view_allocate_model(fv->view, ViewModelTypeLocking, sizeof(FlockViewModel));
+    view_set_draw_callback(fv->view, flock_view_draw_callback);
+    view_set_input_callback(fv->view, flock_view_input_callback);
+    with_view_model(
+        fv->view,
+        FlockViewModel * model,
+        {
+            model->app = NULL;
+            model->selected = 0;
+            model->top = 0;
+            model->card_index = -1;
+            model->order_count = 0;
+            model->sel_valid = false;
+        },
+        false);
+    return fv;
+}
+
+void flock_view_free(FlockView* fv) {
+    furi_assert(fv);
+    view_free(fv->view);
+    free(fv);
+}
+
+View* flock_view_get_view(FlockView* fv) {
+    furi_assert(fv);
+    return fv->view;
+}
+
+void flock_view_set_app(FlockView* fv, void* app) {
+    with_view_model(fv->view, FlockViewModel * model, { model->app = app; }, false);
+}
+
+void flock_view_set_hold_callback(FlockView* fv, FlockViewOkCallback cb, void* context) {
+    fv->hold_cb = cb;
+    fv->hold_ctx = context;
+}
+
+void flock_view_set_ok_callback(FlockView* fv, FlockViewOkCallback cb, void* context) {
+    fv->ok_cb = cb;
+    fv->ok_ctx = context;
+}
+
+void flock_view_refresh(FlockView* fv) {
+    with_view_model(fv->view, FlockViewModel * model, { UNUSED(model); }, true);
+}
+
+void flock_view_reset(FlockView* fv) {
+    with_view_model(
+        fv->view,
+        FlockViewModel * model,
+        {
+            model->selected = 0;
+            model->top = 0;
+            // Drop the device anchor too: a reset means "start at the top of the
+            // list", and a stale MAC would drag the cursor back to it.
+            model->sel_valid = false;
+        },
+        true);
+}

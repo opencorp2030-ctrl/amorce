@@ -1,0 +1,14 @@
+{
+    "compilerOptions": {
+        "checkJs": true,
+        "module": "CommonJS",
+        "typeRoots": [
+            "./applications/system/js_app/packages/fz-sdk/"
+        ],
+        "noLib": true,
+    },
+    "include": [
+        "./applications/system/js_app/examples/apps/Scripts",
+        "./applications/system/js_app/packages/fz-sdk/global.d.ts",
+    ]
+}

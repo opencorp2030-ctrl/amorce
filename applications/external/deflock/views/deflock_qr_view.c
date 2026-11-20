@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 ReconGrunt
+#include "deflock_qr_view.h"
+#include "../recon_app_i.h"
+
+#include <gui/elements.h>
+#include "../plugins/qr_plugin_api.h"
+
+// Buffer size comes from the plugin ABI now (QR_PLUGIN_BUF_LEN = 302 B), so
+// the app never includes qrcodegen.h -- that header travels with the encoder,
+// which lives in the .fal. The plugin carries a _Static_assert tying the two
+// together, so this cannot silently desync.
+#define QR_BUF_LEN QR_PLUGIN_BUF_LEN
+
+// Left square the QR is scaled to fill (px). The right column holds the text.
+#define QR_AREA 52
+
+// Quiet zone kept above the module grid. The canvas is cleared white and the
+// right column starts at QR_AREA + 4, so the only border the grid needs drawn
+// for it is the one against the top edge of the screen.
+#define QR_TOP_PAD 3
+
+// Baseline pitch for the bottom text strip. FontSecondary glyphs are ~7 px tall
+// before descenders, so the old value of 6 drew every line ON TOP of the one
+// above it: all four Support addresses rendered as an unreadable smear with the
+// third chunk half off the bottom of the screen, which is exactly the case that
+// strip exists for (scan failed, type the address by hand).
+#define QR_TEXT_PITCH 8
+
+struct DeflockQrView {
+    View* view;
+    DeflockQrPageCallback page_cb;
+    void* page_ctx;
+    // Borrowed from the scene, which owns the plugin for the screen's lifetime.
+    // NULL means the encoder could not be loaded -- the view must still draw
+    // (text fallback), never dereference.
+    const QrPluginApi* qr_api;
+};
+
+typedef struct {
+    void* app; /**< ReconApp* */
+    bool empty; /**< no marked cameras -> show empty state */
+    bool has_qr; /**< encode succeeded -> draw modules */
+    const QrPluginApi* qr_api; /**< NULL when the encoder plugin is unavailable */
+    int index; /**< 0-based position in the marked list */
+    int total; /**< number of marked cameras */
+    char coords[28]; /**< "lat, lon" */
+    char conf[16]; /**< confidence string */
+    char tags[96]; /**< OSM tag summary (newline-separated) */
+    uint8_t qr[QR_BUF_LEN]; /**< rendered QR (read in the draw callback) */
+} DeflockQrViewModel;
+
+static void deflock_qr_view_draw_callback(Canvas* canvas, void* _model) {
+    DeflockQrViewModel* model = _model;
+    canvas_clear(canvas);
+
+    if(model->empty) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, "No marked cameras");
+        canvas_draw_str_aligned(
+            canvas, 64, 38, AlignCenter, AlignCenter, "Tag cameras in Flock Detect");
+        return;
+    }
+
+    // Left: the QR, scaled so its module grid fills the QR_AREA square. Origin is
+    // nudged so the scaled grid is centred in the area. qr_bottom tracks where the
+    // actual rendered grid ends (NOT the nominal QR_AREA box) -- a short URI (a
+    // donation address, a lat/lng link) encodes at well under the box's max module
+    // count, and the bottom-strip text below uses this to reclaim that slack
+    // rather than always assuming the box is full. QR_AREA is the fallback when
+    // nothing was drawn, which is the same value this always used, so that case is
+    // unchanged.
+    int qr_bottom = QR_AREA;
+    if(model->has_qr && model->qr_api) {
+        const QrPluginApi* qr = model->qr_api;
+        int size = qr->get_size(model->qr);
+        int scale = QR_AREA / size;
+        if(scale < 1) scale = 1;
+        int dim = size * scale;
+        int ox = (QR_AREA - dim) / 2;
+        // VERTICAL SLACK BELONGS TO THE TEXT, NOT TO THE PADDING. Centring the
+        // grid in the QR_AREA box pushed a 33-module code down to oy=9, so the
+        // three lines below it had 16 px of canvas to share and overlapped into
+        // an unreadable smear (see the pitch comment further down). Capped at
+        // QR_TOP_PAD the code sits high, keeps a quiet zone, and hands the ~6 px
+        // it was wasting to the only part of this screen that is a fallback for
+        // the QR failing to scan.
+        int oy = (QR_AREA - dim) / 2;
+        if(oy > QR_TOP_PAD) oy = QR_TOP_PAD;
+        canvas_set_color(canvas, ColorBlack);
+        for(int y = 0; y < size; y++) {
+            for(int x = 0; x < size; x++) {
+                if(qr->get_module(model->qr, x, y)) {
+                    if(scale == 1) {
+                        canvas_draw_dot(canvas, ox + x, oy + y);
+                    } else {
+                        canvas_draw_box(canvas, ox + x * scale, oy + y * scale, scale, scale);
+                    }
+                }
+            }
+        }
+        qr_bottom = oy + dim;
+    } else {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, QR_AREA / 2, 26, AlignCenter, AlignCenter, "QR");
+        canvas_draw_str_aligned(canvas, QR_AREA / 2, 36, AlignCenter, AlignCenter, "n/a");
+    }
+
+    // Right column: index, coords, confidence. A total of 0 means the caller is
+    // showing a single fixed payload rather than a pageable list (the Support
+    // screen), so the "n/m" pager header is suppressed and the two text lines
+    // move up to take its place.
+    canvas_set_font(canvas, FontSecondary);
+    int ry = 8;
+    if(model->total > 0) {
+        // Sized for the widest pair the compiler can prove ("-2147483648/..."),
+        // not for the real domain: both are bounded by the scan-table caps, but
+        // that isn't visible here and -Wformat-truncation is an error.
+        char hdr[24];
+        snprintf(hdr, sizeof(hdr), "%d/%d", model->index + 1, model->total);
+        canvas_draw_str(canvas, QR_AREA + 4, ry, hdr);
+        ry += 10;
+    }
+    canvas_draw_str(canvas, QR_AREA + 4, ry, model->coords);
+    ry += 10;
+    canvas_draw_str(canvas, QR_AREA + 4, ry, model->conf);
+
+    // Bottom strip: one line per '\n'-separated entry in `tags`, drawn full-width
+    // starting just under the rendered QR so it's readable even if the QR isn't.
+    // Was fixed at QR_AREA + 9 regardless of how small the actual QR came out --
+    // for a short URI (any of the ones either caller of this view produces) that
+    // left one, sometimes zero, full lines before hitting the canvas edge, so the
+    // "read the address by hand if the scan fails" promise a caller's comment
+    // made was never visible. qr_bottom (above) is the real edge of the drawn
+    // grid, so a small code now gets the vertical room its size actually leaves.
+    // The nominal QR_AREA is a safe UPPER bound for how tall the drawn grid could
+    // be, but the actual grid this view produces (a short donation address or a
+    // lat/lng link) always comes out well under that -- module count 29-33, not
+    // the ~49 the box is sized for -- so a fixed offset from QR_AREA left this
+    // text sitting inside empty padding while the canvas ran out of room below.
+    // qr_bottom is the real edge of what got drawn; +9 puts the first BASELINE
+    // far enough below it that the glyph tops (baseline - 7) clear the grid.
+    //
+    // Budget, measured on the device: a 33-module grid at QR_TOP_PAD ends at 36,
+    // so the baselines land on 45 / 53 / 61 and the descenders of the last line
+    // finish on 63, the last row of the screen. Three full-width 20-character
+    // chunks -- which is what every Support address wraps to, the 54-character
+    // BCH CashAddr included -- therefore fit without touching each other.
+    int ty = qr_bottom + 9;
+    const char* p = model->tags;
+    while(*p && ty <= 63) {
+        char line[40];
+        size_t n = 0;
+        while(p[n] && p[n] != '\n' && n < sizeof(line) - 1)
+            n++;
+        memcpy(line, p, n);
+        line[n] = '\0';
+        canvas_draw_str(canvas, 0, ty, line);
+        ty += QR_TEXT_PITCH;
+        p += n;
+        if(*p == '\n') p++;
+    }
+}
+
+static bool deflock_qr_view_input_callback(InputEvent* event, void* context) {
+    DeflockQrView* qv = context;
+    bool handled = false;
+
+    if(event->type == InputTypeShort || event->type == InputTypeRepeat) {
+        // Up/Down are accepted as well as Left/Right: this view pages through a
+        // list (cameras, donation addresses), and on a Flipper that reads as
+        // "scroll" as much as it does "page". Both directions do the same thing.
+        if(event->key == InputKeyLeft || event->key == InputKeyUp) {
+            if(qv->page_cb) qv->page_cb(qv->page_ctx, -1);
+            handled = true;
+        } else if(event->key == InputKeyRight || event->key == InputKeyDown) {
+            if(qv->page_cb) qv->page_cb(qv->page_ctx, 1);
+            handled = true;
+        }
+    }
+    return handled;
+}
+
+DeflockQrView* deflock_qr_view_alloc(void) {
+    DeflockQrView* qv = malloc(sizeof(DeflockQrView));
+    qv->page_cb = NULL;
+    qv->page_ctx = NULL;
+    // malloc, not calloc: an uninitialised qr_api would be called through if a
+    // caller ever reached set_content() without set_api() first.
+    qv->qr_api = NULL;
+    qv->view = view_alloc();
+    view_set_context(qv->view, qv);
+    view_allocate_model(qv->view, ViewModelTypeLocking, sizeof(DeflockQrViewModel));
+    view_set_draw_callback(qv->view, deflock_qr_view_draw_callback);
+    view_set_input_callback(qv->view, deflock_qr_view_input_callback);
+    with_view_model(
+        qv->view,
+        DeflockQrViewModel * model,
+        {
+            model->app = NULL;
+            model->empty = true;
+            model->has_qr = false;
+            model->qr_api = NULL;
+            model->index = 0;
+            model->total = 0;
+            model->coords[0] = '\0';
+            model->conf[0] = '\0';
+            model->tags[0] = '\0';
+        },
+        false);
+    return qv;
+}
+
+void deflock_qr_view_free(DeflockQrView* qv) {
+    furi_assert(qv);
+    view_free(qv->view);
+    free(qv);
+}
+
+View* deflock_qr_view_get_view(DeflockQrView* qv) {
+    furi_assert(qv);
+    return qv->view;
+}
+
+void deflock_qr_view_set_app(DeflockQrView* qv, void* app) {
+    with_view_model(qv->view, DeflockQrViewModel * model, { model->app = app; }, false);
+}
+
+void deflock_qr_view_set_page_callback(DeflockQrView* qv, DeflockQrPageCallback cb, void* context) {
+    qv->page_cb = cb;
+    qv->page_ctx = context;
+}
+
+void deflock_qr_view_set_api(DeflockQrView* qv, const QrPluginApi* api) {
+    // Borrowed, not owned: the scene loads the plugin on enter and frees it on
+    // exit, so this pointer is valid exactly as long as the screen is.
+    qv->qr_api = api;
+}
+
+bool deflock_qr_view_set_content(
+    DeflockQrView* qv,
+    const char* url,
+    int index,
+    int total,
+    const char* coords,
+    const char* conf,
+    const char* tags) {
+    // Scratch buffer for the encoder; lives on the stack so it isn't carried in
+    // the model. Same length as the output buffer per the qrcodegen contract.
+    uint8_t temp[QR_BUF_LEN];
+    bool ok = false;
+    with_view_model(
+        qv->view,
+        DeflockQrViewModel * model,
+        {
+            model->empty = false;
+            model->index = index;
+            model->total = total;
+            strncpy(model->coords, coords, sizeof(model->coords) - 1);
+            model->coords[sizeof(model->coords) - 1] = '\0';
+            strncpy(model->conf, conf, sizeof(model->conf) - 1);
+            model->conf[sizeof(model->conf) - 1] = '\0';
+            strncpy(model->tags, tags, sizeof(model->tags) - 1);
+            model->tags[sizeof(model->tags) - 1] = '\0';
+            model->has_qr = qv->qr_api ? qv->qr_api->encode_text(url, temp, model->qr) : false;
+            model->qr_api = qv->qr_api;
+            ok = model->has_qr;
+        },
+        true);
+    return ok;
+}
+
+void deflock_qr_view_set_empty(DeflockQrView* qv) {
+    with_view_model(
+        qv->view,
+        DeflockQrViewModel * model,
+        {
+            model->empty = true;
+            model->has_qr = false;
+            model->index = 0;
+            model->total = 0;
+        },
+        true);
+}

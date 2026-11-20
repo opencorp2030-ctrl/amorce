@@ -1,0 +1,200 @@
+#include "fn_error.h"
+
+#include <stddef.h>
+
+typedef struct {
+    FNError code;
+    const char* title_en;
+    const char* hint_en;
+    const char* title_ru;
+    const char* hint_ru;
+} FNErrorEntry;
+
+static const FNErrorEntry fn_error_table[] = {
+    {FNOk, "Success", "", "Успешно", ""},
+    {FNErrorUnknownCMD,
+     "Unknown command",
+     "Check the request format",
+     "Неизвестная команда",
+     "Проверьте формат посылки"},
+    {FNErrorWrongState,
+     "Wrong FN state",
+     "Command is unavailable at this stage",
+     "Другое состояние ФН",
+     "Команда недоступна на этом этапе"},
+    {FNErrorFailure,
+     "FN refused",
+     "Request details with command 35h",
+     "Отказ ФН",
+     "Запросите детали командой 35h"},
+    {FNErrorFailureKS,
+     "KS refused",
+     "Request details with command 35h",
+     "Отказ КС",
+     "Запросите детали командой 35h"},
+    {FNErrorCMDParamsNotMatchFNEndDate,
+     "Parameters do not match FN term",
+     "Change the command parameters",
+     "Параметры не соответствуют сроку ФН",
+     "Измените параметры команды"},
+    {FNErrorWrongDateTime,
+     "Invalid date or time",
+     "Check the date and time",
+     "Некорректная дата или время",
+     "Проверьте дату и время"},
+    {FNErrorNoRequestedData,
+     "No requested data",
+     "No data in the FN archive",
+     "Нет запрошенных данных",
+     "Данных нет в архиве ФН"},
+    {FNErrorWrongParamValue,
+     "Invalid parameter value",
+     "Check the values",
+     "Некорректное значение параметров",
+     "Проверьте значения"},
+    {FNErrorWrongCommandFfd11,
+     "Command not allowed",
+     "FFD 1.1 only",
+     "Команда не разрешена",
+     "Только для ФФД 1.1"},
+    {FNErrorForbiddenAttribute,
+     "Forbidden attributes",
+     "Check the attributes",
+     "Неразрешенные реквизиты",
+     "Проверьте реквизиты"},
+    {FNErrorDuplicateData,
+     "Duplicate data",
+     "Attribute already sent",
+     "Дублирование данных",
+     "Реквизит уже передан"},
+    {FNErrorNoDataForAccounting,
+     "No data for accounting",
+     "Complete the document data",
+     "Нет данных для учета",
+     "Дополните данные документа"},
+    {FNErrorTooManyPositions,
+     "Too many positions",
+     "Shorten the document",
+     "Превышено число позиций",
+     "Сократите документ"},
+    {FNErrorTlvTooBig,
+     "TLV size exceeded",
+     "Reduce the TLV data",
+     "Превышены размеры TLV",
+     "Сократите TLV-данные"},
+    {FNErrorNoTransport,
+     "No connection to OFD",
+     "Establish an OFD connection",
+     "Нет связи с ОФД",
+     "Установите соединение с ОФД"},
+    {FNErrorResourceExhausted,
+     "FN resource exhausted",
+     "FN must be closed",
+     "Исчерпан ресурс ФН",
+     "Требуется закрытие ФН"},
+    {FNErrorResourceLimited,
+     "FN resource limited",
+     "Check the warning flags",
+     "Ограничение ресурса ФН",
+     "Проверьте флаги предупреждений"},
+    {FNErrorSessionTooLong,
+     "Shift is too long",
+     "Close the shift",
+     "Превышена длительность смены",
+     "Закройте смену"},
+    {FNErrorWrongTimeInterval,
+     "Wrong document interval",
+     "Check the cash register time",
+     "Неверный интервал между документами",
+     "Проверьте время на ККТ"},
+    {FNErrorWrongAttribute,
+     "Invalid attribute",
+     "Check the attribute",
+     "Некорректный реквизит",
+     "Проверьте реквизит"},
+    {FNErrorAttributeNotRegistered,
+     "Attribute not registered",
+     "Check the registration settings",
+     "Реквизит не соответствует регистрации",
+     "Проверьте настройки регистрации"},
+    {FNErrorWrongAnswer,
+     "Invalid answer",
+     "The answer cannot be accepted",
+     "Некорректный ответ",
+     "Ответ не может быть принят"},
+    {FNErrorKmUpdateNegative,
+     "Key update rejected",
+     "",
+     "Отрицательный ответ обновления ключей",
+     ""},
+    {FNErrorKmUpdateUnknown,
+     "Unknown key update answer",
+     "",
+     "Неизвестный ответ обновления ключей",
+     ""},
+    {FNErrorKmUpdateRepeat,
+     "Key update must repeat",
+     "Repeat the update",
+     "Требуется повтор обновления ключей",
+     "Повторите обновление"},
+    {FNErrorMarkingForbidden,
+     "Marking forbidden",
+     "FN is not activated for marking",
+     "Маркировка запрещена",
+     "ФН не активирован для маркировки"},
+    {FNErrorMarkingSequence,
+     "Wrong command sequence",
+     "",
+     "Неверная последовательность команд",
+     ""},
+    {FNErrorMarkingBlocked,
+     "Marking blocked",
+     "Notification area is full",
+     "Маркировка заблокирована",
+     "Переполнена область уведомлений"},
+    {FNErrorKmTableOverflow,
+     "KM table overflow",
+     "No more than 128 KM per receipt",
+     "Переполнена таблица проверки КМ",
+     "Не более 128 КМ в чеке"},
+    {FNErrorKmKeysExpired,
+     "KM key update expired",
+     "Update the KM check keys",
+     "Истек период обновления ключей",
+     "Обновите ключи проверки КМ"},
+    {FNErrorTlvMissingAttribute,
+     "TLV attribute missing",
+     "Check the TLV contents",
+     "В TLV нет нужных реквизитов",
+     "Проверьте состав TLV"},
+    {FNErrorKmNotChecked,
+     "KM was not checked",
+     "",
+     "КМ ранее не проверялся",
+     ""},
+};
+
+#define FN_ERROR_TABLE_SIZE (sizeof(fn_error_table) / sizeof(fn_error_table[0]))
+
+static const FNErrorEntry* fn_error_find(FNError code) {
+    for(size_t i = 0; i < FN_ERROR_TABLE_SIZE; ++i) {
+        if(fn_error_table[i].code == code) return &fn_error_table[i];
+    }
+    return NULL;
+}
+
+bool fn_error_is_known(FNError code) {
+    return fn_error_find(code) != NULL;
+}
+
+const char* fn_error_title(FNError code, FnLang lang) {
+    const FNErrorEntry* entry = fn_error_find(code);
+    if(!entry) return (lang == FnLangRu) ? "Неизвестный код ответа ФН" : "Unknown FN response code";
+    return (lang == FnLangRu) ? entry->title_ru : entry->title_en;
+}
+
+const char* fn_error_hint(FNError code, FnLang lang) {
+    const FNErrorEntry* entry = fn_error_find(code);
+    if(!entry) return "";
+    return (lang == FnLangRu) ? entry->hint_ru : entry->hint_en;
+}

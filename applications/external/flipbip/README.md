@@ -1,0 +1,96 @@
+# FlipBIP - BIP32/39/44
+
+[![Build](https://github.com/xtruan/FlipBIP/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/xtruan/FlipBIP/actions/workflows/build.yml)
+
+## Crypto toolkit for Flipper Zero
+- Last built against `1.0.1` Flipper Zero firmware release
+- Using Trezor crypto libs from `core/v2.5.3` release
+- NOTE: This app uses very close to the maximum Flipper Zero RAM. If you get `furi_check failed` on launch, try running again!
+
+### DONATE IF YOU FIND THE APP USEFUL
+  - ETH (or ERC-20): `xtruan.eth` or `0xa9Ad79502cdaf4F6881f3C2ef260713e5B771CE2`
+  - BTC: `16RP5Ui5QrWrVh2rR7NKAPwE5A4uFjCfbs`
+
+## Background
+
+The goal of this project is to see how much crypto functionality can be brought to the Flipper Zero.
+
+## How to install on Flipper Zero (from app store)
+- Install from here: https://lab.flipper.net/apps/flipbip
+
+## How to install on Flipper Zero (from source)
+- If you do not have one, download a Flipper Zero firmware to get the `fbt` build tool
+- Plug your Flipper Zero in via USB
+- Copy the contents of this folder into the `applications_user` folder of your firmware
+- ~Modify the `site_scons/cc.scons` file in the Flipper Zero firmware to add the `"-Os"` flag~
+
+Then run the command: 
+ ```
+./fbt COMPACT=1 DEBUG=0 launch APPSRC=applications_user/FlipBIP
+ ```
+The application will be compiled and copied onto your device
+
+## Status
+
+### Complete
+
+- Trezor crypto C code ported into `crypto` subfolder
+  - Adapted to use Flipper hardware RNG (see `crypto/rand.c`)
+  - Imports and some C library functions modified for compatibility with FBT
+- Navigation and UI adapted from FAP Boilerplate app
+- BIP39 mnemonic generation
+  - 24, 18, or 12 words configured in settings
+- BIP39 mnemonic to BIP39 seed generation
+- Hierarchical Deterministic (HD) wallet generation from seed
+  - Generation of offline `m/44'/0'/0'/0` BTC wallet
+  - Generation of offline `m/84'/0'/0'/0` BTC native SegWit (BIP84, `bc1q...`) wallet, with `zprv`/`zpub` keys
+  - Generation of offline `m/44'/60'/0'/0` ETH wallet (coded from the $SPORK Castle of ETHDenver 2023!)
+  - Generation of offline `m/44'/3'/0'/0` DOGE wallet
+  - Generation of offline `m/44'/133'/0'/0` ZEC transparent address wallet (by @wh00hw)
+  - Generation of offline `m/44'/128'/0'/0` XMR wallet, Ledger compatible
+    - Private spend key = `sc_reduce(keccak256(k))` where `k` is the BIP32 private key at `m/44'/128'/0'/0/0`, private view key = `sc_reduce(keccak256(spend))`
+    - Shows the Monero 25-word seed (English), the primary address and subaddresses 1-5 of account 0, plus the private spend/view keys
+    - Restore in any Monero wallet (Feather, Cake, Monero GUI/CLI) from the 25-word seed, or as watch-only with the address and private view key
+    - The 25 words are the private spend key in Monero's own mnemonic format, not a separate secret: the BIP39 words still back up every coin, the 25 words only this XMR wallet
+    - NOTE: Trezor derives Monero keys differently (SLIP-10 ed25519), so a Trezor with the same seed shows a different XMR wallet
+  - Similar features to: https://iancoleman.io/bip39/
+- Saving wallets to SD card
+  - Wallets are saved to SD card upon creation in `apps_data/flipbip`
+      - NOTE: `apps_data` folder must already exist on SD card!
+  - Saved wallets can be viewed between app runs
+  - Two ways of encrypting the saved wallet, chosen in `Settings` -> `Encryption`:
+    - `Enclave` (default for new installs): the mnemonic is encrypted with AES-256 using this Flipper's unique key, which never leaves the secure enclave of the chip (idea by @Astrrra)
+      - Only `.flipbip.dat` (and its backup `.flipbip.dat.bak`) is saved; it can only be opened on the same Flipper
+      - Copying the SD card to another Flipper will NOT move the wallet: keep your mnemonic written down!
+      - Same file format as the [Astrrra/FlipBIP](https://github.com/Astrrra/FlipBIP) fork, so wallets saved by it can be opened
+    - `Legacy`: the wallet is encrypted with a randomly generated key, and that key is also encrypted with a key built into the app
+      - `.flipbip.dat` and `.flipbip.key` files are both required to be in `apps_data/flipbip`
+      - Backups of both these files `.flipbip.dat.bak` and `.flipbip.key.bak` are also maintained
+      - NOTE: The wallets should be decently tough to crack off of a Flipper, however any Flipper with the app installed can load a wallet in the `apps_data/flipbip` directory if both the `key` and `dat` file are present
+    - Wallets saved by earlier versions keep using `Legacy` encryption; the app recommends switching on the loading screen, and offers to switch after a new wallet is generated or imported with `Legacy`
+    - Switching in settings re-encrypts the saved wallet; it is written to temporary files and checked before it replaces the old one
+    - Flipper clones without a secure enclave (e.g. Kiisu) always use `Legacy`
+  - Either way, it is HIGHLY RECOMMENDED to use the BIP39 passphrase functionality and store the passphrase in your brain or on paper separately from the Flipper!
+- BIP39 passphrase support
+  - Configured in settings, not persisted between runs for security
+- Import your own mnemonic
+  - Lots of typing required but you can now use the wallet with an existing mnemonic you have saved
+  - Useful to convert paper backup to keys and receive addresses without relying on a laptop or phone
+- Improved receive address generation features
+  - Addresses are now generated at the same time as other pieces of wallet info
+    - This slows down initial wallet load, but makes UI much more responsive
+  - QR code files are now generated for each address and stored in the `apps_data/flipbip` directory
+    - This app is required to view the QR code files: https://github.com/bmatcuk/flipperzero-qrcode
+    - NOTE: This happens during the `View Wallet` step; you must view a wallet after generating/importing a wallet in order to ensure the address QR files are correct
+- Broke out crypto functionality into its own library using `fap_private_libs` feature
+
+### Work in Progress
+
+- More coin types
+  - Support for more custom BIP32 wallet paths
+
+### (FAR) Future
+
+- Custom wallet security
+  - User specified password
+- USB/Bluetooth wallet functionality

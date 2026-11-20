@@ -1,0 +1,39 @@
+Import("env")
+
+env.Append(
+    CPPPATH=[
+        "#/lib/mjs",
+    ],
+    SDK_HEADERS=[
+        File("mjs_core_public.h"),
+        File("mjs_exec_public.h"),
+        File("mjs_object_public.h"),
+        File("mjs_string_public.h"),
+        File("mjs_array_public.h"),
+        File("mjs_primitive_public.h"),
+        File("mjs_util_public.h"),
+        File("mjs_array_buf_public.h"),
+    ],
+)
+
+libenv = env.Clone(FW_LIB_NAME="mjs")
+libenv.ApplyLibFlags()
+
+libenv.AppendUnique(
+    CCFLAGS=[
+        "-Wno-redundant-decls",
+        "-Wno-unused-function",
+    ],
+)
+
+sources = libenv.GlobRecursive("*.c*", exclude=["fal"])
+
+lib = libenv.StaticLibrary("${FW_LIB_NAME}", sources)
+libenv.Install("${LIB_DIST_DIR}", lib)
+
+if env["IS_BASE_FIRMWARE"]:
+    # Only the native compatibility bridge is linked into resident firmware.
+    bridgeenv = libenv.Clone(FW_LIB_NAME="mjs_fal")
+    bridge = bridgeenv.StaticLibrary("${FW_LIB_NAME}", Glob("fal/*.c"))
+    bridgeenv.Install("${LIB_DIST_DIR}", bridge)
+Return("lib")

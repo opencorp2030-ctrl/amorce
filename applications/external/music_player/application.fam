@@ -1,0 +1,15 @@
+App(
+    appid="music_player",
+    name="Music Player",
+    apptype=FlipperAppType.EXTERNAL,
+    targets=["f7"],
+    stack_size=2 * 1024,
+    entry_point="music_player_app",
+    fap_file_assets="resources",
+    fap_icon="icons/music_player_icon_10px.png",
+    fap_icon_assets="icons",
+    fap_libs=["assets", "music_worker"],
+    fap_category="Media",
+    fap_version="1.4",
+    fap_description="An app to play RTTL music files",
+)

@@ -1,0 +1,41 @@
+v3.1:
+
+- Parametric execution now uses the "KDF Cache" whenever possible.
+- The interpretation of nested tags in Auto-Type
+
+v3.0:
+
+- Several memory usage optimizations. (Some of which were thanks to chaffed)
+- A possible error in the capitalization of the first character was corrected. (Thanks to TheEgghead27)
+- The ability to save the KDF derivation was added. (At the user's risk)
+- The unnecessary collection of entropy was eliminated. (Sad, but true)
+- CLI parameters for the entire (remote?) execution cycle (The nightmare of the cybersecurity guys)
+- Ability to open external applications using the CMD tag in AutoType (What could go wrong?)
+- And the favorite most requested by the public: Icons! (No, no one has asked for any of this.)
+
+v2.0:
+
+- Have it all!: KDBX modification/creation, high-entropy password generation, OTP calculation, what more could you want?!
+- Okay, I get it: Auto-lock and auto-close, configurable (from the "Menu" of any base)
+
+v1.2:
+
+- Faster Openings!: The new plugin management allows for optimized memory usage, resulting in more stable and faster openings (KDF speed was not affected).
+- Cleaner Disconnections!: After typing, HID devices, both Bluetooth and USB, are now cleanly disconnected.
+- Smooth User Experience!: HID device connections are now initiated from the Type menu entry, resulting in faster responses when starting an action.
+- Marketing!: New screenshots have been released, which also means you can connect your qFlipper (as long as the database is not decompressing). 
+- Minor Bugs: Uppercase letters have been added for extended UTF-8 characters, and the writing of special characters within fields has been corrected.
+- Oops!: You can now cancel an incorrect typing action (by pressing back on the typing screen).
+
+v1.1:
+
+- Typing Speed ​​and Intercompatibility!: Now you can select the keyboard layout with a special combination! (Long press to the sides in Type Options)
+- More Complex Master Passwords!: Master password entry now supports (almost) all UTF-8 encoding!
+- More Progress Percentages!: Stop being bored while opening your KDBX and enjoy watching the percentages grow!
+- More Stable USB Connection: Smarter and more effective connection setup, fewer errors, smoother performance.
+
+v1.0:
+
+- First public Apps Catalog packaging.
+- Added publication metadata, screenshots, and source repository documentation.
+- Browse KeePass KDBX 4 vaults and send credentials over USB HID or Bluetooth HID.
